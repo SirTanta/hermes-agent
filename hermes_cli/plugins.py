@@ -207,9 +207,20 @@ VALID_HOOKS: Set[str] = {
     #   run_id: int | None, profile_name: str.
     # kanban_task_completed adds: summary: str | None.
     # kanban_task_blocked adds:   reason: str | None.
-    "kanban_task_claimed",
-    "kanban_task_completed",
-    "kanban_task_blocked",
+    #
+    # Full set of kanban lifecycle events (kanban_db.py fires all of these):
+    "kanban_task_created",    # triage/new task first created
+    "kanban_task_todo",       # triage -> todo (specify or auto-promote)
+    "kanban_task_scheduled",  # todo -> scheduled (time box assigned)
+    "kanban_task_ready",      # scheduled -> ready (unblocked)
+    "kanban_task_claimed",    # ready -> running (worker picked up)
+    "kanban_task_completed",  # running -> done (work finished + QA passed)
+    "kanban_task_blocked",    # running -> blocked (needs_input/capability/dependency)
+    "kanban_task_qa_submitted",  # running -> qa_submitted (worker called hermes-qa-submit)
+    "kanban_task_qa_approved",   # qa_submitted -> qa_approved (motoko approved)
+    "kanban_task_qa_rejected",   # qa_submitted -> todo (motoko rejected, rework)
+    "kanban_task_archived",   # running -> archived (manual archive)
+    "kanban_task_comment_added",  # a comment / QA-review note was added to a task
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

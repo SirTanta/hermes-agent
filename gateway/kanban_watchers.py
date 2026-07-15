@@ -886,6 +886,24 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # Read kanban.blocked_triage_escalation_seconds (2026-07-05 war-room
+        # fix). 0 disables — blocked tasks then rely solely on the
+        # BLOCK_RECURRENCE_LIMIT loop breaker, which a block_kind that's
+        # never auto-retried (e.g. "capability") can structurally never
+        # reach. Default 3600s: escalate a task stuck in blocked with no
+        # comment/unblock activity for an hour straight to triage for a
+        # human/specifier, instead of leaving it silently stuck.
+        raw_blocked_triage = kanban_cfg.get("blocked_triage_escalation_seconds", 3600)
+        try:
+            stale_blocked_seconds = int(raw_blocked_triage or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.blocked_triage_escalation_seconds=%r; "
+                "disabling stale-blocked escalation",
+                raw_blocked_triage,
+            )
+            stale_blocked_seconds = 0
+
         # Read kanban.default_assignee — fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
@@ -927,6 +945,38 @@ class GatewayKanbanWatchersMixin:
                     logger.info(
                         "kanban dispatcher: max_in_progress_per_profile=%d",
                         max_in_progress_per_profile,
+                    )
+
+        # Read kanban.max_in_progress_per_parent (2026-07 war-room
+        # starvation fix). When set, no single decompose parent gets more
+        # than N children running at once, even if the global
+        # max_in_progress would allow it. Reserves concurrency headroom
+        # for plain/older tasks against a large auto_decompose fan-out
+        # (all same-priority, all created in one burst) that would
+        # otherwise fill every slot and starve unrelated ready work for
+        # the lifetime of the cascade.
+        raw_per_parent = kanban_cfg.get("max_in_progress_per_parent", None)
+        max_in_progress_per_parent = None
+        if raw_per_parent is not None:
+            try:
+                max_in_progress_per_parent = int(raw_per_parent)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.max_in_progress_per_parent=%r; ignoring",
+                    raw_per_parent,
+                )
+                max_in_progress_per_parent = None
+            else:
+                if max_in_progress_per_parent < 1:
+                    logger.warning(
+                        "kanban dispatcher: kanban.max_in_progress_per_parent=%r is below 1; ignoring",
+                        raw_per_parent,
+                    )
+                    max_in_progress_per_parent = None
+                else:
+                    logger.info(
+                        "kanban dispatcher: max_in_progress_per_parent=%d",
+                        max_in_progress_per_parent,
                     )
 
         # Initial delay so the gateway finishes wiring adapters before the
@@ -1022,6 +1072,8 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    max_in_progress_per_parent=max_in_progress_per_parent,
+                    stale_blocked_seconds=stale_blocked_seconds,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

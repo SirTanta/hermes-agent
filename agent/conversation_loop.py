@@ -25,6 +25,7 @@ import ssl
 import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -520,6 +521,159 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+
+_ITERATION_BUDGET_ROLLOVER_HEADROOM = 1
+
+
+def _should_rollover_iteration_budget_session(agent: Any, api_call_count: int) -> bool:
+    """Return ``True`` when we should roll the session before the budget hits zero.
+
+    The rollover is only useful once the turn has already started and one
+    normal call remains.  That keeps the task on the same topic while giving
+    the fresh child session a full budget before the loop reaches the hard
+    ceiling.
+    """
+    iteration_budget = getattr(agent, "iteration_budget", None)
+    return (
+        api_call_count > 0
+        and not getattr(agent, "_budget_grace_call", False)
+        and iteration_budget is not None
+        and iteration_budget.remaining <= _ITERATION_BUDGET_ROLLOVER_HEADROOM
+    )
+
+
+def _rollover_iteration_budget_session(agent: Any, *, reason: str = "iteration_budget", previous_messages: Optional[list] = None) -> bool:
+    """Start a fresh session when the tool-call budget needs a reset.
+
+    The active message history stays in memory, so the next model call keeps
+    the same topic and continues from the same turn while the session id,
+    logging context, goal binding, and DB lineage roll over to a fresh child
+    session. The current message tail is forwarded into the host lifecycle so
+    context engines can preserve the topic checkpoint across the rollover.
+    Returns True when the rollover succeeded.
+    """
+    session_db = getattr(agent, "_session_db", None)
+    old_session_id = getattr(agent, "session_id", None)
+    if not session_db or not old_session_id:
+        return False
+
+    try:
+        old_title = session_db.get_session_title(old_session_id)
+    except Exception:
+        old_title = None
+
+    try:
+        session_db.end_session(old_session_id, reason)
+        new_session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        agent.session_id = new_session_id
+
+        try:
+            from gateway.session_context import set_current_session_id
+            set_current_session_id(new_session_id)
+        except Exception:
+            os.environ["HERMES_SESSION_ID"] = new_session_id
+
+        try:
+            set_session_context(new_session_id)
+        except Exception:
+            pass
+
+        agent._session_db_created = False
+        session_db.create_session(
+            session_id=new_session_id,
+            source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+            model=agent.model,
+            model_config=agent._session_init_model_config,
+            parent_session_id=old_session_id,
+            system_prompt=getattr(agent, "_cached_system_prompt", None),
+        )
+        agent._session_db_created = True
+
+        if old_title:
+            try:
+                new_title = session_db.get_next_title_in_lineage(old_title)
+                session_db.set_session_title(new_session_id, new_title)
+            except Exception:
+                logger.debug("Could not propagate title on iteration-budget rollover", exc_info=True)
+
+        try:
+            session_db.update_system_prompt(
+                new_session_id,
+                getattr(agent, "_cached_system_prompt", None),
+            )
+        except Exception:
+            logger.debug("Could not update system prompt on iteration-budget rollover", exc_info=True)
+
+        try:
+            from hermes_cli.goals import migrate_goal_to_session
+            migrate_goal_to_session(old_session_id, new_session_id, reason=reason)
+        except Exception as _goal_err:
+            logger.debug("Could not migrate goal on iteration-budget rollover: %s", _goal_err)
+
+        try:
+            if hasattr(agent, "_transition_context_engine_session"):
+                agent._transition_context_engine_session(
+                    old_session_id=old_session_id,
+                    new_session_id=new_session_id,
+                    previous_messages=previous_messages or [],
+                    carry_over_context=True,
+                    reason=reason,
+                )
+        except Exception as _ce_err:
+            logger.debug("context engine rollover transition (iteration_budget): %s", _ce_err)
+
+        try:
+            if agent._memory_manager:
+                agent._memory_manager.on_session_switch(
+                    new_session_id,
+                    parent_session_id=old_session_id,
+                    reset=False,
+                    reason=reason,
+                )
+        except Exception as _me_err:
+            logger.debug("memory manager on_session_switch (iteration_budget): %s", _me_err)
+
+        if getattr(agent, "event_callback", None):
+            try:
+                agent.event_callback("session:rollover", {
+                    "platform": agent.platform or "",
+                    "session_id": new_session_id,
+                    "old_session_id": old_session_id,
+                    "reason": reason,
+                })
+            except Exception:
+                logger.debug("event_callback error on session:rollover", exc_info=True)
+
+        # Reset session-local counters so the fresh child gets a full budget.
+        agent.iteration_budget = IterationBudget(getattr(agent, "max_iterations", 0) or 0)
+        agent._api_call_count = 0
+        agent._last_flushed_db_idx = 0
+        agent._flushed_db_message_ids = set()
+        agent._flushed_db_message_session_id = new_session_id
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Iteration-budget rollover failed for session %s — keeping the current session: %s",
+            old_session_id,
+            exc,
+            exc_info=True,
+        )
+        try:
+            session_db.reopen_session(old_session_id)
+        except Exception:
+            pass
+        agent.session_id = old_session_id
+        try:
+            from gateway.session_context import set_current_session_id
+            set_current_session_id(old_session_id)
+        except Exception:
+            os.environ["HERMES_SESSION_ID"] = old_session_id
+        try:
+            set_session_context(old_session_id)
+        except Exception:
+            pass
+        return False
+
 def run_conversation(
     agent,
     user_message: str,
@@ -651,7 +805,22 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        # Before the last allowed tool-call budget disappears, roll the
+        # session forward so the agent keeps the same topic with a fresh
+        # turn budget instead of hitting the ceiling and falling back to the
+        # summary path.
+        if _should_rollover_iteration_budget_session(agent, api_call_count):
+            if _rollover_iteration_budget_session(agent, reason="iteration_budget", previous_messages=messages):
+                api_call_count = 0
+                agent._api_call_count = 0
+                _turn_exit_reason = "session_rolled_over(iteration_budget)"
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\nIteration budget is nearly exhausted; rolled over to fresh session {agent.session_id} and continuing..."
+                    )
+                continue
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -662,9 +831,18 @@ def run_conversation(
         if agent._budget_grace_call:
             agent._budget_grace_call = False
         elif not agent.iteration_budget.consume():
+            if _rollover_iteration_budget_session(agent, reason="iteration_budget", previous_messages=messages):
+                api_call_count = 0
+                agent._api_call_count = 0
+                _turn_exit_reason = "session_rolled_over(iteration_budget)"
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\nIteration budget exhausted; rolled over to fresh session {agent.session_id} and continuing..."
+                    )
+                continue
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
-                agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
+                agent._safe_print(f"\nIteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
 
         # Fire step_callback for gateway hooks (agent:step event)

@@ -2740,6 +2740,18 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-parent (decompose-batch) concurrency cap (2026-07 war-room
+        # starvation fix). When set to a positive int, no single decompose
+        # parent can have more than N children running at once, even if
+        # the global max_in_progress / max_spawn caps would allow it.
+        # Tasks blocked this way defer to the next dispatcher tick. Unset
+        # (None) means "no per-parent cap" — backward-compatible with
+        # existing installs. Reserves concurrency headroom for plain,
+        # non-batch ready tasks against a large auto_decompose fan-out
+        # (all same-priority, all created in one burst) that would
+        # otherwise occupy every global slot and starve unrelated work
+        # for the lifetime of the cascade.
+        "max_in_progress_per_parent": None,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
@@ -2755,6 +2767,16 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+
+        # Blocked-task escalation (2026-07-05): a ``blocked`` task with no
+        # comment/unblock activity for this many seconds is force-routed to
+        # ``triage`` for a human/specifier, regardless of block_kind or
+        # recurrence count. Exists because the BLOCK_RECURRENCE_LIMIT loop
+        # breaker requires an actual unblock-then-reblock cycle to ever
+        # fire, which a block_kind that's never auto-retried (e.g.
+        # "capability") can structurally never accumulate — without this,
+        # such a task can sit in blocked forever.  0 disables.
+        "blocked_triage_escalation_seconds": 3600,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

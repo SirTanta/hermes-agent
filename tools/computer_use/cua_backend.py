@@ -192,7 +192,12 @@ def _resolve_mcp_invocation(
         # The driver knows the subcommand but didn't surface its own path.
         # Keep our resolved driver_cmd; the args are still authoritative.
         return driver_cmd, args
-    return command, args
+    # Surface 8 + library-path fix: the manifest resolves *inside* the
+    # wrapper to the actual binary (e.g. ld-linux-x86-64.so.2), but only
+    # the wrapper carries the --library-path that makes that binary work.
+    # Always use driver_cmd (which may be a wrapper script) as command,
+    # and take only args from the manifest.
+    return driver_cmd, args
 
 # Regex to parse element lines from get_window_state AX tree markdown.
 #

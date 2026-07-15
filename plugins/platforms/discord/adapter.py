@@ -746,9 +746,9 @@ def _read_dm_role_auth_guild() -> Optional[int]:
 # Default timeout for Discord interactive button views (exec approval, slash
 # confirm, update prompt, clarify choice). Used when the user has not set
 # ``approvals.discord_prompt_timeout`` in config.yaml. 300s (5 min) matches
-# the previous hardcoded value. Bounded to a sane range — Discord
-# interaction tokens expire from the API's side at ~15 minutes, so 900s is
-# the practical ceiling.
+# the previous hardcoded value. Bounded to a sane range — Discord interaction
+# tokens expire from the API's side at ~15 minutes, so 900s is the practical
+# ceiling.
 _DISCORD_PROMPT_TIMEOUT_DEFAULT = 300
 _DISCORD_PROMPT_TIMEOUT_MIN = 30
 _DISCORD_PROMPT_TIMEOUT_MAX = 900
@@ -762,15 +762,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _read_discord_prompt_timeout() -> int:
-    """Return the timeout (in seconds) for Discord button views.
-
-    Reads ``approvals.discord_prompt_timeout`` from config.yaml. Falls back
-    to the historical 300s default for any missing / malformed value, and
-    clamps the result to ``[_DISCORD_PROMPT_TIMEOUT_MIN,
-    _DISCORD_PROMPT_TIMEOUT_MAX]`` so a typo can't accidentally make
-    interactive prompts disappear (too short) or outlive Discord's own
-    15-minute interaction-token expiry (too long).
-    """
+    """Return the timeout (in seconds) for Discord button views."""
     raw: Any = None
     try:
         from hermes_cli.config import read_raw_config
@@ -785,11 +777,54 @@ def _read_discord_prompt_timeout() -> int:
         seconds = int(raw)
     except (TypeError, ValueError):
         return _DISCORD_PROMPT_TIMEOUT_DEFAULT
-    if seconds < _DISCORD_PROMPT_TIMEOUT_MIN:
-        return _DISCORD_PROMPT_TIMEOUT_MIN
-    if seconds > _DISCORD_PROMPT_TIMEOUT_MAX:
-        return _DISCORD_PROMPT_TIMEOUT_MAX
-    return seconds
+    return min(max(seconds, _DISCORD_PROMPT_TIMEOUT_MIN), _DISCORD_PROMPT_TIMEOUT_MAX)
+
+
+class _BotChainGuard:
+    """Caps unbounded bot-to-bot reply chains on the Discord inbound path."""
+
+    def __init__(self) -> None:
+        self._max = env_int("DISCORD_BOT_CHAIN_MAX", 6)
+        self._min_interval = env_float("DISCORD_BOT_CHAIN_MIN_INTERVAL_SEC", 4.0)
+        self._filler_words = env_int("DISCORD_BOT_CHAIN_FILLER_WORDS", 3)
+        self._filler_strikes = env_int("DISCORD_BOT_CHAIN_FILLER_STRIKES", 2)
+        self._recent_keep = 5
+        self._state: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _norm(text: str) -> str:
+        return " ".join((text or "").lower().split())
+
+    def note_human(self, channel_key: str) -> None:
+        self._state.pop(channel_key, None)
+
+    def should_reply(self, channel_key: str, content: str):
+        now = time.monotonic()
+        st = self._state.get(channel_key)
+        if st is None:
+            st = {"count": 0, "last_ts": 0.0, "filler": 0, "recent": []}
+            self._state[channel_key] = st
+        if self._max > 0 and st["count"] >= self._max:
+            return False, "depth-cap %d/%d" % (st["count"], self._max)
+        if self._min_interval > 0 and (now - st["last_ts"]) < self._min_interval:
+            return False, "cooldown"
+        norm = self._norm(content)
+        words = norm.split()
+        if norm and norm in st["recent"]:
+            return False, "near-duplicate"
+        if self._filler_words > 0 and 0 < len(words) <= self._filler_words:
+            st["filler"] += 1
+            if st["filler"] >= self._filler_strikes:
+                return False, "filler x%d" % st["filler"]
+        else:
+            st["filler"] = 0
+        st["count"] += 1
+        st["last_ts"] = now
+        if norm:
+            st["recent"].append(norm)
+            if len(st["recent"]) > self._recent_keep:
+                st["recent"].pop(0)
+        return True, "ok %d/%d" % (st["count"], self._max)
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -882,6 +917,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        # Bot-to-bot loop guard: caps unbounded mutual-reply chains.
+        self._bot_chain = _BotChainGuard()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1111,7 +1148,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
 
                 # Always ignore our own messages
-                if message.author == self._client.user:
+                _client_user = self._client.user
+                _author_id = getattr(message.author, "id", None)
+                _client_user_id = getattr(_client_user, "id", None)
+                if message.author == _client_user or (
+                    _client_user is not None
+                    and _author_id is not None
+                    and _client_user_id is not None
+                    and _author_id == _client_user_id
+                ):
                     return
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
@@ -1142,6 +1187,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
                 else:
+                    # Non-bot (human): a human turn resets the bot-to-bot
+                    # chain for this channel so collaboration re-opens.
+                    _ck = str(getattr(message.channel, "parent_id", None) or message.channel.id)
+                    self._bot_chain.note_human(_ck)
                     # Non-bot: enforce the configured user/role allowlists.
                     # Pass guild + is_dm so role checks are scoped to the
                     # originating guild (prevents cross-guild DM bypass, see
@@ -5134,7 +5183,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 # partition point.  Everything before this is already in the
                 # session transcript.  (Redundant when _after_obj is set, but
                 # needed for cold start.)
-                if msg.author == self._client.user:
+                _client_user = self._client.user
+                _author_id = getattr(msg.author, "id", None)
+                _client_user_id = getattr(_client_user, "id", None)
+                if msg.author == _client_user or (
+                    _client_user is not None
+                    and _author_id is not None
+                    and _client_user_id is not None
+                    and _author_id == _client_user_id
+                ):
                     break
                 line = _keep(msg)
                 if line is None:
@@ -6211,6 +6268,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                    return
+
+            # Bot-to-bot loop protection: cap unbounded mutual-reply chains
+            # (depth / cooldown / degeneration). Human turns reset via
+            # on_message -> note_human(). Applies to all non-DM channels.
+            if getattr(message.author, "bot", False):
+                _chain_key = parent_channel_id or str(message.channel.id)
+                _allow, _reason = self._bot_chain.should_reply(_chain_key, normalized_content)
+                if not _allow:
+                    logger.info(
+                        "[%s] bot-chain guard suppressed reply in %s: %s",
+                        self.name, _chain_key, _reason,
+                    )
                     return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).

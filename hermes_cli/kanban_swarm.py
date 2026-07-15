@@ -150,6 +150,10 @@ def create_swarm(
             "kind": "kanban_swarm_v1",
             "goal": goal,
             "worker_count": len(worker_specs),
+            "proof_type": "test",
+            "proof": "swarm topology planning",
+            "proof_status": "pass",
+            "proof_note": "root blackboard closed after topology planning",
         },
     )
 

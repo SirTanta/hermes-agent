@@ -76,6 +76,8 @@ class TestDiscordBotFilter(unittest.TestCase):
         # Replicate the exact filter logic from discord.py on_message
         if message.author == client_user:
             return False  # own messages always ignored
+        if client_user is not None and getattr(message.author, "id", None) == getattr(client_user, "id", None):
+            return False  # own messages always ignored
 
         if getattr(message.author, "bot", False):
             allow = allow_bots.lower().strip()
@@ -98,6 +100,13 @@ class TestDiscordBotFilter(unittest.TestCase):
         bot_user = _make_author(is_self=True)
         msg = _make_message(author=bot_user)
         self.assertFalse(self._run_filter(msg, "all", bot_user))
+
+    def test_own_messages_same_id_different_object_ignored(self):
+        """Bot's own messages are ignored even if Discord gives a distinct author object."""
+        bot_user = _make_author(is_self=True)
+        client_user = _make_author(is_self=True)
+        msg = _make_message(author=bot_user)
+        self.assertFalse(self._run_filter(msg, "all", client_user))
 
     def test_human_messages_always_accepted(self):
         """Human messages are always accepted regardless of allow_bots."""
@@ -206,8 +215,13 @@ class TestDiscordBotFilter(unittest.TestCase):
 
     def test_default_is_none(self):
         """Default behavior (no env var) should be 'none'."""
-        default = os.getenv("DISCORD_ALLOW_BOTS", "none")
-        self.assertEqual(default, "none")
+        original = os.environ.pop("DISCORD_ALLOW_BOTS", None)
+        try:
+            default = os.getenv("DISCORD_ALLOW_BOTS", "none")
+            self.assertEqual(default, "none")
+        finally:
+            if original is not None:
+                os.environ["DISCORD_ALLOW_BOTS"] = original
 
     def test_case_insensitive(self):
         """Allow_bots value should be case-insensitive."""

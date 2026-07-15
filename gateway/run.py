@@ -216,6 +216,23 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _format_gateway_profile_status(profile_name: str, connected_platforms: list[Any]) -> str:
+    """Render a profile-first startup summary for logs and status views."""
+    platform_names = ", ".join(
+        sorted(
+            str(getattr(platform, "value", platform) or "").strip().lower()
+            for platform in connected_platforms
+            if str(getattr(platform, "value", platform) or "").strip()
+        )
+    )
+    if not platform_names:
+        platform_names = "none"
+    return (
+        f"Gateway profile '{profile_name}' running with {len(connected_platforms)} "
+        f"connected platform(s): {platform_names}"
+    )
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -7232,13 +7249,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # may only have credentials for a subset of platforms.  Rather than
                 # failing hard, degrade gracefully and allow cron jobs to run (#5196).
                 logger.warning(
-                    "No adapter could be created for any of the %d configured platform(s). "
-                    "Check that required dependencies are installed and credentials are set. "
+                    "Profile '%s' has no adapters enabled: none of the %d configured platform(s) "
+                    "could be created. Check that required dependencies are installed and credentials are set. "
                     "Gateway will continue for cron job execution.",
+                    self._active_profile_name(),
                     enabled_platform_count,
                 )
             else:
-                logger.warning("No messaging platforms enabled.")
+                logger.warning(
+                    "Profile '%s' has no messaging platforms enabled.",
+                    self._active_profile_name(),
+                )
                 logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
@@ -7259,7 +7280,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         })
         
         if connected_count > 0:
-            logger.info("Gateway running with %s platform(s)", connected_count)
+            logger.info(
+                "%s",
+                _format_gateway_profile_status(
+                    self._active_profile_name(),
+                    list(self.adapters.keys()),
+                ),
+            )
         
         # Build initial channel directory for send_message name resolution
         try:

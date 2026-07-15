@@ -511,6 +511,51 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+
+    # QA gate: non-motoko WORKERS must use kanban_submit_qa before completing.
+    # This ensures every task passes through Motoko's review queue.
+    # "Worker" is the same signal _enforce_worker_task_ownership() uses above
+    # (HERMES_KANBAN_TASK set = a dispatcher-spawned run scoped to this one
+    # task) so orchestrator profiles keep their legitimate ability to close
+    # out arbitrary tasks administratively. Fail-closed: a DB error while
+    # checking must BLOCK completion, never silently allow it through — a
+    # prior version of this gate swallowed that exception and let it pass,
+    # which is how two auto-decomposer-spawned duplicate tasks shipped
+    # "done" with zero Motoko sign-off.
+    _current_profile = os.environ.get("HERMES_PROFILE", "")
+    _worker_scoped = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    if _worker_scoped and _current_profile.lower() != "motoko":
+        try:
+            _kb_check, _conn_check = _connect(board=args.get("board"))
+            try:
+                _row = _conn_check.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='qa_submitted'",
+                    (tid,)
+                ).fetchone()
+                _qa_count = _row[0] if _row else 0
+            finally:
+                _conn_check.close()
+            if _qa_count == 0:
+                return tool_error(
+                    f"kanban_complete blocked: task {tid} has not been submitted for QA review. "
+                    f"You must call kanban_submit_qa before completing. "
+                    f"Usage: kanban_submit_qa(task_id=<task_id>, evidence=<one-line evidence summary>) "
+                    f"This routes the task to Motoko for sign-off. "
+                    f"Do NOT call kanban_complete directly."
+                )
+        except Exception as _qa_check_err:
+            logger.exception(
+                "kanban_complete: QA-gate check failed for task %s — blocking "
+                "completion fail-closed rather than allowing it through",
+                tid,
+            )
+            return tool_error(
+                f"kanban_complete blocked: could not verify QA-submission status for "
+                f"task {tid} due to an internal error ({_qa_check_err}). Completion is "
+                f"blocked fail-closed. Call kanban_submit_qa and retry, or investigate "
+                f"the error before completing."
+            )
+
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -591,6 +636,13 @@ def _handle_complete(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        metadata = kb.prepare_completion_metadata(
+            summary=summary,
+            result=result,
+            metadata=metadata,
+            allow_autofill=True,
+        )
+        metadata = _stamp_worker_session_metadata(tid, metadata)
         try:
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
@@ -741,6 +793,46 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _handle_submit_qa(args: dict, **kw) -> str:
+    """Atomically submit the current worker's task for Motoko QA."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    evidence = args.get("evidence")
+    if not evidence or not str(evidence).strip():
+        return tool_error("evidence is required — summarize the QA handoff")
+    evidence = redact_sensitive_text(str(evidence), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.submit_qa_task(
+                conn,
+                tid,
+                evidence=evidence,
+                expected_run_id=_worker_run_id(tid),
+                board=board,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not submit {tid} for QA (unknown id or not in running state)"
+                )
+            run = kb.latest_run(conn, tid)
+            return _ok(task_id=tid, run_id=run.id if run else None, status="qa_review")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_qa: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_qa failed")
+        return tool_error(f"kanban_submit_qa: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1201,9 +1293,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
-        "tasks via ``kanban_create`` during this run, list their ids "
+        "tests_run, decisions, findings, etc). ``metadata`` must also "
+        "carry the proof fields required by the proof gate: ``proof_type``, "
+        "``proof``, ``proof_status`` (must be ``pass``), and ``proof_note``. "
+        "At least one of ``summary`` or ``result`` is required. If you created "
+        "new tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
         "automation. If you produced deliverable files (charts, PDFs, "
@@ -1284,6 +1378,33 @@ KANBAN_COMPLETE_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_SUBMIT_QA_SCHEMA = {
+    "name": "kanban_submit_qa",
+    "description": (
+        "Atomically hand the current worker's running task to Motoko QA "
+        "review. Only an active task with a live run may submit; the run "
+        "is closed and the task moves to qa_review with assignee motoko."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "Short evidence summary for the QA handoff. This is "
+                    "recorded on the task and shown to Motoko."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["evidence"],
     },
 }
 
@@ -1615,6 +1736,15 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_submit_qa",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_QA_SCHEMA,
+    handler=_handle_submit_qa,
+    check_fn=_check_kanban_mode,
+    emoji="🧪",
 )
 
 registry.register(

@@ -39,6 +39,7 @@ _STATUS_ICONS = {
     "running":  "●",
     "scheduled":"⏱",
     "blocked":  "⊘",
+    "review":   "🔍",
     "done":     "✓",
     "archived": "—",
 }
@@ -530,8 +531,49 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Structured handoff summary for downstream tasks. "
                                  "Falls back to --result if omitted.")
     p_complete.add_argument("--metadata", default=None,
-                            help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
-                                 '"tests_run": 12}\'). Stored on the closing run.')
+                            help='JSON dict of structured facts. Must include proof_type, '
+                                 'proof, proof_status, and proof_note. Example: '
+                                 '\'{"changed_files": [...], "tests_run": 12, '
+                                 '"proof_type": "test", "proof": "pytest ...", '
+                                 '"proof_status": "pass", "proof_note": "all green"}\'. '
+                                 'Stored on the closing run.')
+
+    p_submit_qa = sub.add_parser(
+        "submit-qa",
+        aliases=["qa-submit"],
+        help="Submit the current running task to Motoko QA review",
+    )
+    p_submit_qa.add_argument(
+        "task_id",
+        nargs="?",
+        help="Task id (defaults to $HERMES_KANBAN_TASK)",
+    )
+    p_submit_qa.add_argument(
+        "evidence",
+        nargs="+",
+        help="One-line evidence summary for the QA handoff",
+    )
+
+    p_finalize = sub.add_parser(
+        "finalize",
+        help="Block an active worker that exits without a terminal transition",
+    )
+    p_finalize.add_argument(
+        "task_id",
+        nargs="?",
+        help="Task id (defaults to $HERMES_KANBAN_TASK)",
+    )
+    p_finalize.add_argument(
+        "--reason",
+        default="worker exited without a terminal transition",
+        help="Reason recorded on the block event",
+    )
+    p_finalize.add_argument(
+        "--kind",
+        default="transient",
+        choices=sorted(kb.VALID_BLOCK_KINDS),
+        help="Block kind to use for the finalizer path",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -611,6 +653,59 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Validate the promotion without mutating state",
     )
     p_promote.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
+    p_retriage = sub.add_parser(
+        "retriage",
+        help="Manually route one or more stalled todo/blocked tasks back to triage for re-scoping",
+    )
+    p_retriage.add_argument("task_id")
+    p_retriage.add_argument(
+        "reason",
+        nargs="*",
+        help="Audit-trail reason (recorded on the task_events row)",
+    )
+    p_retriage.add_argument(
+        "--ids",
+        nargs="+",
+        default=None,
+        help="Additional task ids to retriage with the same reason (bulk mode)",
+    )
+    p_retriage.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the retriage without mutating state",
+    )
+    p_retriage.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
+    p_merge = sub.add_parser(
+        "merge",
+        help="Fold one or more duplicate/overlapping tasks into a single primary task",
+    )
+    p_merge.add_argument("primary_id", help="Task id to keep as the canonical task")
+    p_merge.add_argument(
+        "duplicate_ids", nargs="+",
+        help="Task id(s) to archive and fold into primary_id",
+    )
+    p_merge.add_argument(
+        "--reason", nargs="*", default=None,
+        help="Audit-trail reason (recorded on both primary and duplicate task_events rows)",
+    )
+    p_merge.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the merge without mutating state",
+    )
+    p_merge.add_argument(
         "--json",
         dest="json",
         action="store_true",
@@ -872,6 +967,10 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     Returns a shell-style exit code (0 on success, non-zero on error).
     """
+    # Ensure plugins are loaded so lifecycle hooks fire correctly.
+    from hermes_cli.plugins import discover_plugins
+    discover_plugins()
+
     action = getattr(args, "kanban_action", None)
     if not action:
         # No subaction given: print help via the stored parser reference.
@@ -952,11 +1051,16 @@ def kanban_command(args: argparse.Namespace) -> int:
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
+            "submit-qa": _cmd_submit_qa,
+            "qa-submit": _cmd_submit_qa,
+            "finalize":  _cmd_finalize,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "retriage": _cmd_retriage,
+            "merge":    _cmd_merge,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1891,21 +1995,87 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    try:
+        metadata = kb.prepare_completion_metadata(
+            summary=summary,
+            result=args.result,
+            metadata=metadata,
+            allow_autofill=True,
+        )
+    except kb.CompletionProofError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.CompletionProofError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_submit_qa(args: argparse.Namespace) -> int:
+    tid = getattr(args, "task_id", None) or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    evidence = " ".join(getattr(args, "evidence", []) or []).strip()
+    if not evidence:
+        print("evidence is required", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok = kb.submit_qa_task(
+            conn,
+            tid,
+            evidence=evidence,
+            expected_run_id=_worker_run_id_for(tid),
+            board=os.environ.get("HERMES_KANBAN_BOARD"),
+        )
+        if not ok:
+            print(f"cannot submit {tid} for QA (unknown id or not running)", file=sys.stderr)
+            return 1
+        run = kb.latest_run(conn, tid)
+        print(f"Submitted {tid} for QA" + (f" (run {run.id})" if run else ""))
+    return 0
+
+
+def _cmd_finalize(args: argparse.Namespace) -> int:
+    tid = getattr(args, "task_id", None) or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None) or "worker exited without a terminal transition"
+    kind = getattr(args, "kind", None) or "transient"
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        if not task or task.status != "running" or not task.current_run_id:
+            print(f"{tid} has no active running transition to finalize", file=sys.stderr)
+            return 0
+        ok = kb.block_task(
+            conn,
+            tid,
+            reason=reason,
+            kind=kind,
+            expected_run_id=_worker_run_id_for(tid),
+        )
+        if not ok:
+            print(f"cannot finalize {tid} (unknown id or stale run)", file=sys.stderr)
+            return 1
+        print(f"Finalized {tid}: blocked")
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
@@ -2068,6 +2238,91 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_retriage(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    extra_ids = list(getattr(args, "ids", None) or [])
+    ids: list[str] = []
+    seen: set[str] = set()
+    for tid in [args.task_id, *extra_ids]:
+        if tid not in seen:
+            ids.append(tid)
+            seen.add(tid)
+
+    results: list[dict[str, object]] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            ok, err = kb.retriage_task(
+                conn,
+                tid,
+                actor=author,
+                reason=reason,
+                dry_run=bool(args.dry_run),
+            )
+            results.append({
+                "task_id": tid,
+                "retriaged": ok,
+                "dry_run": bool(args.dry_run),
+                "reason": reason,
+                "error": err,
+            })
+
+    failed = [r for r in results if not r["retriaged"]]
+    if as_json:
+        payload: object = results[0] if len(results) == 1 else results
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if not failed else 1
+
+    tag = " (dry)" if args.dry_run else ""
+    label = "Would retriage" if args.dry_run else "Retriaged"
+    for r in results:
+        if r["retriaged"]:
+            suffix = f": {reason}" if reason else ""
+            print(f"{label} {r['task_id']} -> triage{tag}{suffix}")
+        else:
+            print(f"cannot retriage {r['task_id']}: {r['error']}", file=sys.stderr)
+    return 0 if not failed else 1
+
+
+def _cmd_merge(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    author = _profile_author()
+    as_json = getattr(args, "json", False)
+    dup_ids = list(args.duplicate_ids)
+
+    with kb.connect_closing() as conn:
+        ok, err = kb.merge_task(
+            conn,
+            args.primary_id,
+            dup_ids,
+            actor=author,
+            reason=reason,
+            dry_run=bool(args.dry_run),
+        )
+
+    result = {
+        "primary_id": args.primary_id,
+        "duplicate_ids": dup_ids,
+        "merged": ok,
+        "dry_run": bool(args.dry_run),
+        "reason": reason,
+        "error": err,
+    }
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
+
+    if ok:
+        tag = " (dry)" if args.dry_run else ""
+        label = "Would merge" if args.dry_run else "Merged"
+        suffix = f": {reason}" if reason else ""
+        print(f"{label} {', '.join(dup_ids)} -> {args.primary_id}{tag}{suffix}")
+        return 0
+    print(f"cannot merge: {err}", file=sys.stderr)
+    return 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -2140,6 +2395,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = _coerce_positive_int(
             _kanban_cfg.get("max_in_progress_per_profile")
         )
+        max_in_progress_per_parent = _coerce_positive_int(
+            _kanban_cfg.get("max_in_progress_per_parent")
+        )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
@@ -2150,6 +2408,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
+        max_in_progress_per_parent = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
@@ -2161,6 +2420,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_parent=max_in_progress_per_parent,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2418,7 +2678,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

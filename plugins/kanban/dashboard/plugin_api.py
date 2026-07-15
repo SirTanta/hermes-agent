@@ -151,6 +151,18 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
+# Display labels for columns — internal status names stay unchanged in DB
+COLUMN_LABELS: dict[str, str] = {
+    "triage":    "Triage",
+    "todo":      "Queued",
+    "scheduled": "On Hold",
+    "ready":     "Ready",
+    "running":   "In Progress",
+    "blocked":   "Blocked",
+    "review":    "Review",
+    "done":      "Done",
+}
+
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -475,7 +487,7 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            col = t.status if t.status in columns else ("review" if t.status == "qa_review" else "todo")
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -499,7 +511,7 @@ def get_board(
 
         return {
             "columns": [
-                {"name": name, "tasks": columns[name]} for name in columns.keys()
+                {"name": name, "label": COLUMN_LABELS.get(name, name.title()), "tasks": columns[name]} for name in columns.keys()
             ],
             "tenants": tenants,
             "assignees": assignees,
@@ -843,11 +855,20 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
+                try:
+                    metadata = kanban_db.prepare_completion_metadata(
+                        summary=payload.summary,
+                        result=payload.result,
+                        metadata=payload.metadata,
+                        allow_autofill=True,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
                 ok = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
-                    metadata=payload.metadata,
+                    metadata=metadata,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -1186,11 +1207,22 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
+                        try:
+                            metadata = kanban_db.prepare_completion_metadata(
+                                summary=payload.summary,
+                                result=payload.result,
+                                metadata=payload.metadata,
+                                allow_autofill=True,
+                            )
+                        except ValueError as exc:
+                            entry.update(ok=False, error=str(exc))
+                            results.append(entry)
+                            continue
                         ok = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
                             summary=payload.summary,
-                            metadata=payload.metadata,
+                            metadata=metadata,
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)

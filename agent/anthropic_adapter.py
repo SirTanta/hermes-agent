@@ -2742,6 +2742,13 @@ def _is_stream_unavailable_error(exc: Exception) -> bool:
     err_lower = str(exc).lower()
     if "stream" in err_lower and "not supported" in err_lower:
         return True
+    if "__fields__" in err_lower:
+        # MiniMax's Anthropic-compatible SSE path can trip an Anthropic SDK
+        # streaming parser bug while building the final message snapshot.
+        # The non-streaming messages.create() path succeeds against the same
+        # request, so treat this as a stream-only incompatibility and fall
+        # back instead of failing the whole turn.
+        return True
     if "invokemodelwithresponsestream" in err_lower:
         from agent.bedrock_adapter import is_streaming_access_denied_error
 

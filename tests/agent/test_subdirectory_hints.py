@@ -290,6 +290,22 @@ class TestPermissionErrorHandling:
             # Result may be None (backend skipped) — the key point is no crash
             assert result is None or isinstance(result, str)
 
+    def test_check_tool_call_survives_missing_home_directory(self, project):
+        """Path.expanduser/Path.home failures should not crash hint discovery."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+
+        def patched_expanduser(self):
+            raise RuntimeError("Could not determine home directory.")
+
+        def patched_home():
+            raise RuntimeError("Could not determine home directory.")
+
+        with patch.object(Path, "expanduser", patched_expanduser), patch.object(Path, "home", patched_home):
+            result = tracker.check_tool_call(
+                "terminal", {"command": f"cd {project / 'backend'} && ls"}
+            )
+        assert result is None or isinstance(result, str)
+
 
 class TestOutsideWorkspaceRejection:
     """Direct tests for _is_valid_subdir rejecting outside-workspace paths."""

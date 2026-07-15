@@ -289,6 +289,29 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    # Don't re-decompose tasks that were routed to triage via block-loop
+    # detection or stale-blocked escalation. These tasks retain their
+    # block_kind — a fresh task in triage has block_kind=None.
+    # Without this guard, a blocked capability task that hits
+    # BLOCK_RECURRENCE_LIMIT lands in triage only to be immediately
+    # re-decomposed, creating an infinite loop (#auto-decomposer-thrash).
+    if task.block_kind is not None:
+        with kb.connect_closing() as _conn:
+            kb.specify_triage_task(_conn, task_id, author="auto-decomposer")
+        return DecomposeOutcome(
+            task_id, True,
+            f"task was previously blocked (kind={task.block_kind!r}) — "
+            "promoting to todo for human triage instead of re-decomposing",
+            fanout=False,
+        )
+    # Respect [no-decompose] opt-out tag in title or body.
+    # Promotes the task from triage -> todo (recompute_ready then takes it to ready).
+    _title_lower = (task.title or "").lower()
+    _body_lower  = (task.body  or "").lower()
+    if "[no-decompose]" in _title_lower or "[no-decompose]" in _body_lower:
+        with kb.connect_closing() as _conn:
+            kb.specify_triage_task(_conn, task_id, author="auto-decomposer")
+        return DecomposeOutcome(task_id, True, "[no-decompose] tag — skipped decomposition, promoted to todo", fanout=False)
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)

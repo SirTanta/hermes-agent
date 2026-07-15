@@ -2614,6 +2614,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         sanitize_anthropic_kwargs(
             api_kwargs, log_prefix=getattr(agent, "log_prefix", "")
         )
+        # MiniMax's Anthropic-compatible SSE path currently trips an
+        # Anthropic SDK streaming parser bug (AttributeError: __fields__).
+        # Non-streaming messages.create() succeeds against the same request,
+        # so bypass streaming entirely for this provider until upstream fixes
+        # land.
+        if getattr(agent, "provider", "") == "minimax-oauth":
+            create_kwargs = dict(api_kwargs)
+            create_kwargs.pop("stream", None)
+            return agent._anthropic_client.messages.create(**create_kwargs)
+
         # Use the Anthropic SDK's streaming context manager
         with agent._anthropic_client.messages.stream(**api_kwargs) as stream:
             # The Anthropic SDK exposes the raw httpx response on
@@ -2687,7 +2697,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # this return value is discarded anyway.
             if agent._interrupt_requested:
                 return None
-            return stream.get_final_message()
+            try:
+                return stream.get_final_message()
+            except Exception as exc:
+                from agent.anthropic_adapter import _is_stream_unavailable_error
+
+                if not _is_stream_unavailable_error(exc):
+                    raise
+                logger.debug(
+                    "%sAnthropic stream finalization failed; falling back to messages.create(): %s",
+                    getattr(agent, "log_prefix", ""),
+                    exc,
+                )
+                create_kwargs = dict(api_kwargs)
+                create_kwargs.pop("stream", None)
+                return agent._anthropic_client.messages.create(**create_kwargs)
 
     def _call():
         import httpx as _httpx

@@ -5320,6 +5320,104 @@ class TestRunConversation:
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
+    def test_iteration_budget_rolls_over_to_fresh_session(self, agent, monkeypatch):
+        """When the tool-call budget is exhausted and a session DB is
+        available, Hermes should rotate into a fresh child session and keep
+        the turn going instead of failing the task."""
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+        agent.session_id = "session-parent"
+        agent._cached_system_prompt = "You are helpful."
+        agent._session_init_model_config = {"model": "test-model"}
+        agent._session_db = MagicMock()
+        agent._session_db.get_session_title.return_value = "Task Alpha"
+        agent._session_db.get_next_title_in_lineage.return_value = "Task Alpha 2"
+        agent._session_db.get_session.return_value = {"system_prompt": "You are helpful."}
+        agent._ext_prefetch_cache = ""
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.prefetch_all.return_value = ""
+        agent.context_compressor = MagicMock()
+        agent.context_compressor.last_prompt_tokens = 0
+        agent.context_compressor.should_compress = MagicMock(return_value=False)
+        agent.context_compressor.on_session_start = MagicMock()
+        agent.event_callback = MagicMock()
+
+        class _RolloverBudget:
+            def __init__(self):
+                self.calls = 0
+                self.max_total = 2
+                self._remaining = 2
+
+            @property
+            def used(self):
+                return self.calls
+
+            @property
+            def remaining(self):
+                return self._remaining
+
+            def consume(self):
+                self.calls += 1
+                if self._remaining > 0:
+                    self._remaining -= 1
+                    return True
+                return False
+
+            def refund(self):
+                self._remaining += 1
+
+        agent.iteration_budget = _RolloverBudget()
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, final_resp,
+        ]
+
+        mock_record_failure = MagicMock(return_value=False)
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(agent, "_append_guardrail_observation", side_effect=lambda *args, **kwargs: args[2]),
+            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do the kanban work")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Done!"
+        assert mock_record_failure.call_count == 0
+        first_end_call = agent._session_db.end_session.call_args_list[0]
+        assert first_end_call.args == ("session-parent", "iteration_budget")
+        rollover_creates = [
+            call for call in agent._session_db.create_session.call_args_list
+            if call.kwargs.get("parent_session_id") == "session-parent"
+        ]
+        assert len(rollover_creates) >= 1
+        create_kwargs = rollover_creates[0].kwargs
+        assert create_kwargs["session_id"] != "session-parent"
+        assert agent.session_id != "session-parent"
+        assert any(
+            call.args == (create_kwargs["session_id"], "Task Alpha 2")
+            for call in agent._session_db.set_session_title.call_args_list
+        )
+        assert any(
+            call.args == (create_kwargs["session_id"], "You are helpful.")
+            for call in agent._session_db.update_system_prompt.call_args_list
+        )
+        agent.context_compressor.on_session_start.assert_called()
+        agent._memory_manager.on_session_switch.assert_called()
+        assert any(
+            call.kwargs.get("reason") == "iteration_budget"
+            for call in agent._memory_manager.on_session_switch.call_args_list
+        )
+        agent.event_callback.assert_called()
+
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
         is unset (non-kanban runs are unaffected by #29747 gap 2)."""

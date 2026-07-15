@@ -133,7 +133,9 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
     show = kc.run_slash(f"show {tid}")
     assert "performance section" in show
@@ -142,7 +144,9 @@ def test_run_slash_show_includes_comments(kanban_home):
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
     kc.run_slash(f"comment {tid} '{'x' * 30}' --max-len 20")
     show = kc.run_slash(f"show {tid}")
     assert "trimmed to 20 chars by --max-len" in show
@@ -152,11 +156,40 @@ def test_run_slash_comment_max_len_trims_long_body(kanban_home):
 def test_run_slash_block_unblock_cycle(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
     # Claim first so block() finds it running
     kc.run_slash(f"claim {tid}")
     assert "Blocked" in kc.run_slash(f"block {tid} 'need decision'")
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
+
+
+def test_run_slash_submit_qa_and_finalize(kanban_home):
+    out = kc.run_slash("create 'qa-cli' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
+    kc.run_slash(f"claim {tid}")
+    submit_out = kc.run_slash(f"submit-qa {tid} evidence from cli")
+    assert "queued for Motoko QA" in submit_out or "Submitted" in submit_out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "qa_review"
+        assert task.assignee == "motoko"
+
+    out2 = kc.run_slash("create 'finalize-cli' --assignee alice")
+    tid2 = re.search(r"(t_[a-f0-9]+)", out2).group(1)
+    kc.run_slash(f"claim {tid2}")
+    finalize_out = kc.run_slash(f"finalize {tid2}")
+    assert "Finalized" in finalize_out or "blocked" in finalize_out
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid2)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.current_run_id is None
 
 
 def test_run_slash_json_output(kanban_home):
@@ -177,7 +210,9 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
     ctx = kc.run_slash(f"context {tid}")
     assert "tech spec" in ctx
@@ -245,7 +280,9 @@ def test_run_slash_usage_error_returns_message(kanban_home):
 def test_run_slash_assign_reassigns(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
     assert "Assigned" in kc.run_slash(f"assign {tid} bob")
     show = kc.run_slash(f"show {tid}")
     assert "bob" in show

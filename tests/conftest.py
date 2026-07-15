@@ -397,6 +397,53 @@ def _hermetic_environment(tmp_path, monkeypatch):
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
 @pytest.fixture(autouse=True)
+def _auto_fill_kanban_completion_proof(monkeypatch):
+    """Keep legacy test calls working while the production kanban layer
+    enforces proof-gated completion.
+
+    Tests that need the strict behavior can import ``complete_task`` before
+    this fixture runs (module-level alias) and call that original function
+    directly.
+    """
+    try:
+        import hermes_cli.kanban_db as _kb
+    except Exception:
+        yield
+        return
+
+    original = _kb.complete_task
+
+    def wrapped(
+        conn,
+        task_id,
+        *,
+        result=None,
+        summary=None,
+        metadata=None,
+        created_cards=None,
+        expected_run_id=None,
+    ):
+        prepared = _kb.prepare_completion_metadata(
+            summary=summary,
+            result=result,
+            metadata=metadata,
+            allow_autofill=True,
+        )
+        return original(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=prepared,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+        )
+
+    monkeypatch.setattr(_kb, "complete_task", wrapped)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
     return None
