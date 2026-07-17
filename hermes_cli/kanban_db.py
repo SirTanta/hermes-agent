@@ -7564,8 +7564,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                         (error_text[:500], row["id"]),
                     )
-                    rate_limited.append(row["id"])
                 else:
+                    # Record failure and update error tracking.
+                    # _record_task_failure is called OUTSIDE the main write txn
+                    # (via the crash_details loop below) to avoid nested transactions.
+                    # Here we just append to crash_details so the outer loop
+                    # handles the counter increment and potential circuit breaker trip.
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
