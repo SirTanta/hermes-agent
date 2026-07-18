@@ -7722,7 +7722,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # breaker immediately (failure_limit=1) inside the SAME
                 # write_txn so the state transition is durable even if the
                 # dispatcher crashes right after this.
-                failures = int(row["consecutive_failures"]) + 1
+                # NOTE: do NOT pre-increment failures here; the atomic block
+                # below already increments via _record_task_failure. Pre-
+                # incrementing causes 0→2 instead of 0→1 (double-count bug).
                 effective_limit = 1
                 limit_source = "dispatcher"
                 # Revert the ready-flip above and set blocked atomically
