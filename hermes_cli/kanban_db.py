@@ -2044,6 +2044,30 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_fingerprint_count INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "dependency_blocked" not in cols:
+        # Flag set when a task called kanban_block(kind='dependency').
+        # When True, recompute_ready will NOT auto-promote the task even when
+        # all parents are done — an explicit kanban_unblock is required.
+        # This prevents the dependency_wait → parent-completes → respawn loop.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "dependency_blocked",
+            "dependency_blocked INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "max_children" not in cols:
+        # Per-task cap on how many children may be created. NULL = unlimited.
+        # When set, create_task rejects creation of a child that would exceed
+        # this cap. Enforces the bounded child-count invariant for controlled
+        # rollout lanes.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "max_children",
+            "max_children INTEGER",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2665,13 +2689,19 @@ def create_task(
                         run_id=None,
                         context={"status": task_status, "parents": list(parents)},
                     )
-                else:
+                elif initial_status == "running":
+                    # Treat "running" as a synonym for "ready" for worker dispatch;
+                    # both map to DB status "ready". The distinction is informational
+                    # only. We still honour the parent-completion gate below so that
+                    # a child created with initial_status="running" but unmet parents
+                    # ends up in "todo" as expected.
                     task_status = "ready"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
+                            raise ValueError(
+                                f"unknown parent task(s): {', '.join(missing)}"
+                            )
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
@@ -2683,10 +2713,40 @@ def create_task(
                         "kanban_task_created",
                         task_id,
                         board=get_current_board(),
-            lane="deed-commands",
+                        lane="deed-commands",
                         assignee=assignee,
                         run_id=None,
-                        context={"status": task_status, "parents": list(parents)},
+                        context={
+                            "status": task_status,
+                            "parents": list(parents),
+                        },
+                    )
+                else:
+                    task_status = "ready"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(
+                                f"unknown parent task(s): {', '.join(missing)}"
+                            )
+                        rows = conn.execute(
+                            "SELECT status FROM tasks WHERE id IN "
+                            "(" + ",".join("?" * len(parents)) + ")",
+                            parents,
+                        ).fetchall()
+                        if any(r["status"] != "done" for r in rows):
+                            task_status = "todo"
+                    _fire_kanban_lifecycle_hook(
+                        "kanban_task_created",
+                        task_id,
+                        board=get_current_board(),
+                        lane="deed-commands",
+                        assignee=assignee,
+                        run_id=None,
+                        context={
+                            "status": task_status,
+                            "parents": list(parents),
+                        },
                     )
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -2751,6 +2811,29 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                # Bounded child-count enforcement: reject creation of a child
+                # that would exceed any parent's explicit max_children cap.
+                # Each parent is checked independently; the first violation aborts.
+                if parents:
+                    cap_rows = conn.execute(
+                        """
+                        SELECT id AS parent_id, max_children
+                          FROM tasks
+                         WHERE id IN (""" + ",".join(["?"] * len(parents)) + """)
+                           AND max_children IS NOT NULL
+                        """,
+                        list(parents),
+                    ).fetchall()
+                    for prow in cap_rows:
+                        child_count = conn.execute(
+                            "SELECT COUNT(*) FROM task_links WHERE parent_id = ?",
+                            (prow["parent_id"],),
+                        ).fetchone()[0]
+                        if child_count >= prow["max_children"]:
+                            raise ValueError(
+                                f"parent {prow['parent_id']} has reached its max_children "
+                                f"cap of {prow['max_children']}; cannot create more children"
+                            )
                 _append_event(
                     conn,
                     task_id,
@@ -3438,11 +3521,19 @@ def recompute_ready(
             cur_status = row["status"]
 
             # ── Parent-completion check ──────────────────────────────────────
-            # For non-sticky blocked tasks (circuit-breaker path): if all
-            # parents are done, the task can be auto-recovered.  If no
-            # parents exist, also allow through (circuit-breaker tasks may
-            # have no parent links).  Skip only when parents are open.
+            # ``parents`` is used at line 3550+ regardless of which branch handled
+            # the task, so fetch it once here before the branching.
+            parents = conn.execute(
+                "SELECT t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+
             if cur_status == "blocked" and not _has_sticky_block(conn, task_id):
+                # Non-sticky circuit-breaker path: if all parents are done (or
+                # no parents exist), the task CAN be auto-recovered.  Skip only
+                # when parents are still open.
                 parents_done = conn.execute(
                     "SELECT COUNT(*) AS total, "
                     "SUM(CASE WHEN t.status IN ('done', 'archived') THEN 1 ELSE 0 END) AS done "
@@ -3451,26 +3542,33 @@ def recompute_ready(
                     (task_id,),
                 ).fetchone()
                 if parents_done["total"] > 0 and parents_done["done"] != parents_done["total"]:
-                    # Parents still open — skip until they complete
                     continue
 
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                # Exception: if ALL parents are done, the dependency that
-                # triggered this block is satisfied — the child should be
-                # promoted and the sticky fingerprint cleared, because the
-                # next block event (if any) will carry a fresh fingerprint.
+                # ``_has_sticky_block`` is True when block_kind is set and
+                # block_recurrences >= STICKY_BLOCK_THRESHOLD. These tasks
+                # require an explicit kanban_unblock to exit.
                 row_bk = conn.execute(
-                    "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+                    "SELECT block_kind, dependency_blocked FROM tasks WHERE id = ?",
+                    (task_id,),
                 ).fetchone()
-                if row_bk["block_kind"] != "dependency":
-                    # For non-dependency sticky blocks (needs_input /
-                    # capability / transient): only skip if parents are
-                    # still open.  If parents are done, allow through so
-                    # the reset code below can clear the fingerprint.
+                dep_blocked = (
+                    row_bk["dependency_blocked"]
+                    if row_bk and "dependency_blocked" in row_bk.keys()
+                    else 0
+                )
+
+                # dependency_blocked=1: parked on a dependency-kind block —
+                # requires explicit kanban_unblock even after parents complete.
+                # This prevents the observer-respawn loop (Defect 5).
+                if dep_blocked:
+                    continue
+
+                # For non-dependency sticky blocks (capability / needs_input /
+                # transient): hold only if parents are still open.
+                # If all parents are done, allow through so the sticky block
+                # fingerprint can be cleared by the normal parent-completion path.
+                if row_bk["block_kind"] and row_bk["block_kind"] != "dependency":
                     parents_done = conn.execute(
                         "SELECT COUNT(*) AS total, "
                         "SUM(CASE WHEN t.status IN ('done', 'archived') THEN 1 ELSE 0 END) AS done "
@@ -3480,12 +3578,7 @@ def recompute_ready(
                     ).fetchone()
                     if parents_done["total"] > 0 and parents_done["done"] != parents_done["total"]:
                         continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
+                # Otherwise fall through to the normal parent-completion check.
             if all(p["status"] in ("done", "archived") for p in parents):
                 assignee_row = conn.execute(
                     "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
@@ -3627,6 +3720,26 @@ def claim_task(
                 reason="parents_not_done",
             )
             return None
+
+        # Profile-compatibility guard: reject claims on tasks assigned to
+        # QA-only reviewer profiles (e.g. motoko) when the claiming worker
+        # is not itself a QA-profile.  A QA-only profile is not an
+        # implementation agent — it cannot own the implementation work.
+        # This closes the loop where a reviewer might get auto-dispatched
+        # to a task that was submitted for review, then incorrectly work
+        # on it as if it were a new assignment.
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if assignee_row:
+            _assignee = assignee_row["assignee"]
+            if _assignee and _assignee.lower() in {"motoko"}:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "qa_only_assignee", "assignee": _assignee},
+                )
+                return None
+
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4438,6 +4551,51 @@ def complete_task(
         allow_autofill=False,
     )
 
+    # Graph-completion invariant: a parent task cannot reach 'done' while it
+    # has any active (non-terminal) children. This prevents Defect 2 — a
+    # coordinator/goal-mode parent completing while its evidence-producing
+    # children are unstarted or nonterminal.
+    # Advisory event emitted even on rejection so the rejection is auditable.
+    active_children = conn.execute(
+        """
+        SELECT COUNT(*) FROM task_links l
+        JOIN tasks c ON c.id = l.child_id
+        WHERE l.parent_id = ?
+          AND c.status NOT IN ('done', 'archived')
+        """,
+        (task_id,),
+    ).fetchone()[0]
+    if active_children > 0:
+        child_rows = conn.execute(
+            """
+            SELECT c.id, c.title, c.status FROM task_links l
+            JOIN tasks c ON c.id = l.child_id
+            WHERE l.parent_id = ?
+              AND c.status NOT IN ('done', 'archived')
+            LIMIT 10
+            """,
+            (task_id,),
+        ).fetchall()
+        # Emit event in a tiny dedicated txn — the rejection is auditable even
+        # though the task state was not mutated.
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_children_active",
+                {
+                    "active_child_count": active_children,
+                    "sample_children": [
+                        {"id": r["id"], "title": r["title"], "status": r["status"]}
+                        for r in child_rows
+                    ],
+                },
+            )
+        raise ValueError(
+            f"cannot complete {task_id}: {active_children} active child task(s) "
+            f"are not yet terminal. All children must be 'done' or 'archived' "
+            f"before the parent can complete. Child ids: "
+            f"{', '.join(r['id'] for r in child_rows)}"
+        )
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4452,7 +4610,8 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0,
                        last_block_fingerprint = NULL,
-                       block_fingerprint_count = 0
+                       block_fingerprint_count = 0,
+                       dependency_blocked = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
@@ -4471,7 +4630,8 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0,
                        last_block_fingerprint = NULL,
-                       block_fingerprint_count = 0
+                       block_fingerprint_count = 0,
+                       dependency_blocked = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
@@ -4688,6 +4848,87 @@ def submit_qa_task(
             "evidence": evidence,
             "submitted_by": submitted_by,
         },
+    )
+    return True
+
+
+def reject_qa_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
+) -> bool:
+    """Atomically hand a Motoko QA review back to the worker as blocked.
+
+    This is the missing counterpart to ``submit_qa_task``: when Motoko's QA
+    review finds missing work or a hard blocker, the task is sent back to
+    ``blocked`` (not ``ready`` or ``running``) with kind ``capability`` so
+    it requires explicit human or operator unblock before the worker can
+    retry.  This closes the loop that allowed a rejected task to re-enter
+    the ``ready → claimed → complete`` pipeline without any gate.
+
+    Returns True on success; False when the task is not in ``qa_review``
+    state or the run id doesn't match.
+    """
+    reason = (reason or "").strip() or "QA review rejected: see comments for detail"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] != "qa_review":
+            return False
+
+        # Transition qa_review → blocked with kind=capability.
+        # capability kind is used because this is a hard wall that no
+        # amount of retry loops can clear — it requires human input or
+        # structural repair of the work before the worker can proceed.
+        fp = _block_fingerprint("capability", reason)
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'blocked',
+                   assignee      = 'motoko',
+                   block_kind    = 'capability',
+                   last_block_reason = ?,
+                   block_recurrences = 0,
+                   last_block_fingerprint = ?,
+                   block_fingerprint_count = 0,
+                   dependency_blocked = 0
+             WHERE id = ?
+               AND status = 'qa_review'
+            """,
+            (reason, fp, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+
+        _append_event(
+            conn,
+            task_id,
+            "qa_rejected",
+            {"reason": reason, "kind": "capability"},
+        )
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": reason, "kind": "capability", "recurrences": 0},
+        )
+
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=board or get_current_board(),
+        lane="deed-commands",
+        assignee="motoko",
+        run_id=None,
+        reason=reason,
     )
     return True
 
@@ -5159,10 +5400,11 @@ def block_task(
                        last_block_reason = ?,
                        block_recurrences = 0,
                        last_block_fingerprint = ?,
-                       block_fingerprint_count = 0
+                       block_fingerprint_count = 0,
+                       dependency_blocked = 1
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                """ + (" AND current_run_id = ?" if expected_run_id is not None else ""),
                 (kind, reason, fp, task_id) if expected_run_id is None
                 else (kind, reason, fp, task_id, int(expected_run_id)),
             )
@@ -5250,7 +5492,8 @@ def block_task(
                            last_block_reason = ?,
                            block_recurrences = ?,
                            last_block_fingerprint = ?,
-                           block_fingerprint_count = 1
+                           block_fingerprint_count = 1,
+                           dependency_blocked = 0
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
@@ -5268,7 +5511,8 @@ def block_task(
                            last_block_reason = ?,
                            block_recurrences = ?,
                            last_block_fingerprint = ?,
-                           block_fingerprint_count = 1
+                           block_fingerprint_count = 1,
+                           dependency_blocked = 0
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
@@ -5560,8 +5804,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        # Also fetch dependency_blocked so we can unblock 'todo' tasks that
+        # were parked there by block_task(kind='dependency').
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id, dependency_blocked FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'todo')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -5576,14 +5823,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
+        # Re-gate on parent completion before flipping 'blocked'/'todo' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
         # if parents are still in progress the task must wait in 'todo'
         # until recompute_ready picks it up. RCA: Bug 2 at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         row = conn.execute(
-            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+            "SELECT assignee, dependency_blocked, status FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
@@ -5592,43 +5840,25 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
-        # NOTE: deliberately does NOT touch ``block_recurrences``,
-        # ``block_kind``, or ``consecutive_failures``. Resetting the
-        # recurrence counter on unblock is exactly the amnesia that let a
-        # cron unblock → worker re-block loop run unbounded (Dale's report).
-        # Both counters survive the unblock so their respective loop
-        # detectors can function correctly:
-        #
-        # - ``block_recurrences``: trips the unblock-loop breaker
-        #   (``BLOCK_RECURRENCE_LIMIT``) when a cron keeps unblocking the
-        #   same task for the same reason.
-        #
-        # - ``consecutive_failures``: trips the circuit breaker
-        #   (``failure_limit``) when a task keeps crashing/timeout-ing.
-        #   Without this guard, a task that repeatedly exhausts its
-        #   iteration budget would cycle forever:
-        #   block → unblock (cf reset) → respawn → crash → block → …
-        #   The counter must be preserved so the breaker can accumulate
-        #   across recovery cycles (#35072).
-        #
-        # Both counters are reset to 0 only on successful completion
-        # (see ``complete_task`` / ``_clear_failure_counter``).
-        #
-        # The block fingerprint circuit breaker (``block_fingerprint_count``)
-        # IS reset on human unblock: a deliberate unblock is a fresh start
-        # for the fingerprint counter, so human action clears the loop guard.
-        # The fingerprint columns (``last_block_fingerprint``) are also cleared
-        # so a subsequent block starts a new fingerprint from scratch.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "last_failure_error = NULL, "
-            "block_kind = NULL, "
-            "last_block_reason = NULL, "
-            "last_block_fingerprint = NULL, block_fingerprint_count = 0 "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')",
+
+        # Only unblock 'todo' if it was parked there by a dependency block
+        # (dependency_blocked=1). A 'todo' task without that flag wasn't
+        # dependency-blocked and must not be unblocked by this function.
+        if row["status"] == "todo" and not row["dependency_blocked"]:
+            return False
+
+        upd = conn.execute(
+            "UPDATE tasks "
+            "SET status = ?, "
+            "    dependency_blocked = 0, "
+            "    block_kind = NULL, "
+            "    last_block_fingerprint = NULL, "
+            "    block_fingerprint_count = 0 "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'todo') "
+            "  AND (status != 'todo' OR dependency_blocked = 1)",
             (new_status, task_id),
         )
-        if cur.rowcount != 1:
+        if upd.rowcount != 1:
             return False
         _append_event(
             conn, task_id, "unblocked",
@@ -6453,10 +6683,26 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    path_str = str(path)
+    # Guard: reject workspace_path collision with any non-archived task.
+    # A collision means two running tasks would share one physical directory,
+    # and completing one would delete the other's artifacts (#33774-variant).
+    colliding = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE workspace_path = ? "
+        "  AND id != ? "
+        "  AND status NOT IN ('done', 'archived', 'failed', 'cancelled')",
+        (path_str, task_id),
+    ).fetchone()
+    if colliding:
+        raise ValueError(
+            f"workspace_path collision: task {task_id} cannot use "
+            f"workspace_path {path_str!r} — already used by non-archived task {colliding[0]}"
+        )
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
+            (path_str, task_id),
         )
 
 
