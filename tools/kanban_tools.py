@@ -630,12 +630,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
-            except kb.ArtifactPreservationError as artifact_err:
+            except kb.CompletionProofError as proof_err:
                 return tool_error(
-                    f"kanban_complete could not preserve the declared artifacts: "
-                    f"{artifact_err}. Your task is still in-flight and its "
-                    f"scratch workspace was kept. Fix the artifact path or "
-                    f"storage error, then retry kanban_complete with the same handoff."
+                    f"kanban_complete proof validation failed: {proof_err}. "
+                    f"Your task is still in-flight. Provide the required proof "
+                    f"metadata (proof_type, proof, proof_status, proof_note) and "
+                    f"retry with the same summary/metadata."
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -656,6 +656,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.ArtifactPreservationError as artifact_err:
+                return tool_error(
+                    f"kanban_complete could not preserve declared artifact(s): "
+                    f"{', '.join(artifact_err.unavailable_paths)}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"Create or attach the missing deliverable files, then "
+                    f"retry kanban_complete with the same summary/metadata."
                 )
             if not ok:
                 return tool_error(
@@ -1428,10 +1436,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
-        "``summary`` or ``result`` is required. If you created new "
-        "tasks via ``kanban_create`` during this run, list their ids "
-        "in ``created_cards`` — the kernel verifies them so phantom "
+        "tests_run, decisions, findings, etc). Proof metadata is "
+        "required inside ``metadata`` — see the ``metadata`` parameter "
+        "description for the required fields (proof_type, proof, "
+        "proof_status, proof_note). At least one of ``summary`` or "
+        "``result`` is required. If you created new tasks via "
+        "``kanban_create`` during this run, list their ids in "
+        "``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
         "automation. If you produced deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
@@ -1460,9 +1471,47 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "\"findings\": [...]}. Additionally, proof metadata "
+                    "is required and must include: "
+                    "\"proof_type\" (string, e.g. 'test', 'file', 'url'), "
+                    "\"proof\" (string, the actual proof artifact/path/URL), "
+                    "\"proof_status\" (string, e.g. 'pass', 'fail', 'na'), "
+                    "\"proof_note\" (string, brief explanation or context). "
+                    "Surfaced to downstream workers alongside ``summary``."
                 ),
+                "properties": {
+                    "proof_type": {
+                        "type": "string",
+                        "description": (
+                            "Category of proof — e.g. 'test', 'file', "
+                            "'url', 'audit', 'manual'."
+                        ),
+                    },
+                    "proof": {
+                        "type": "string",
+                        "description": (
+                            "The actual proof artifact: a file path, "
+                            "URL, test output snippet, or equivalent "
+                            "evidence that the work was completed."
+                        ),
+                    },
+                    "proof_status": {
+                        "type": "string",
+                        "description": (
+                            "Outcome of the proof check — e.g. 'pass', "
+                            "'fail', 'na', 'reviewed'."
+                        ),
+                    },
+                    "proof_note": {
+                        "type": "string",
+                        "description": (
+                            "Brief context or explanation of the proof — "
+                            "any caveats, limitations, or notes for "
+                            "downstream reviewers."
+                        ),
+                    },
+                },
+                "required": ["proof_type", "proof", "proof_status", "proof_note"],
             },
             "result": {
                 "type": "string",

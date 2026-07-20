@@ -3210,6 +3210,122 @@ def add_attachment(
         return int(cur.lastrowid or 0)
 
 
+def _persist_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict,
+) -> dict:
+    """Copy declared scratch artifacts to durable task attachments.
+
+    Completion removes managed scratch workspaces. If a worker declares an
+    artifact inside that workspace, preserve it first and rewrite metadata to
+    point at the durable attachment copy. External artifact paths are left as-is.
+    """
+    artifacts = metadata.get("artifacts") if isinstance(metadata, dict) else None
+    if not isinstance(artifacts, (list, tuple)):
+        return metadata
+
+    task = get_task(conn, task_id)
+    workspace = resolve_workspace(task) if task is not None else None
+    try:
+        workspace_resolved = workspace.resolve() if workspace is not None else None
+    except OSError:
+        workspace_resolved = None
+
+    cleaned: list[str] = []
+    missing: list[str] = []
+    dest_dir = task_attachments_dir(task_id)
+    used_names: set[str] = set()
+
+    for raw in artifacts:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        original = raw.strip()
+        src = Path(original).expanduser()
+        if not src.exists():
+            missing.append(original)
+            continue
+
+        should_copy = False
+        if workspace_resolved is not None:
+            try:
+                src.resolve().relative_to(workspace_resolved)
+                should_copy = True
+            except (OSError, ValueError):
+                should_copy = False
+
+        if not should_copy:
+            cleaned.append(original)
+            continue
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stem = src.stem or "artifact"
+        suffix = src.suffix
+        candidate = src.name or "artifact"
+        idx = 1
+        while candidate in used_names or (dest_dir / candidate).exists():
+            candidate = f"{stem}_{idx}{suffix}"
+            idx += 1
+        used_names.add(candidate)
+        dest = dest_dir / candidate
+        shutil.copy2(src, dest)
+        stored = str(dest.resolve())
+        add_attachment(
+            conn,
+            task_id,
+            filename=candidate,
+            stored_path=stored,
+            size=dest.stat().st_size,
+            uploaded_by="kanban_complete",
+        )
+        cleaned.append(stored)
+
+    if missing:
+        raise ArtifactPreservationError(missing)
+
+    updated = dict(metadata)
+    updated["artifacts"] = cleaned
+    return updated
+
+
+def store_attachment_bytes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    filename: str,
+    data: bytes,
+    *,
+    content_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+) -> int:
+    """Store attachment bytes under the task attachment directory."""
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("attachment data must be bytes")
+    size = len(data)
+    if size > KANBAN_ATTACHMENT_MAX_BYTES:
+        raise AttachmentTooLarge(size, KANBAN_ATTACHMENT_MAX_BYTES)
+    safe_name = Path(filename or "attachment").name or "attachment"
+    dest_dir = task_attachments_dir(task_id, board=board)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / safe_name
+    stem = dest.stem or "attachment"
+    suffix = dest.suffix
+    idx = 1
+    while dest.exists():
+        dest = dest_dir / f"{stem}_{idx}{suffix}"
+        idx += 1
+    dest.write_bytes(bytes(data))
+    return add_attachment(
+        conn,
+        task_id,
+        filename=dest.name,
+        stored_path=str(dest.resolve()),
+        content_type=content_type,
+        size=size,
+        uploaded_by=uploaded_by,
+    )
+
+
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
     rows = conn.execute(
         "SELECT * FROM task_attachments WHERE task_id = ? ORDER BY created_at ASC, id ASC",
@@ -4407,6 +4523,33 @@ class CompletionProofError(ValueError):
     """Raised when task completion is missing required proof metadata."""
 
 
+class ArtifactPreservationError(ValueError):
+    """Raised when a declared scratch artifact is unavailable at completion time."""
+
+    def __init__(self, unavailable_paths: list[str]):
+        self.unavailable_paths = list(unavailable_paths)
+        super().__init__(
+            f"declared artifact(s) unavailable: {', '.join(unavailable_paths)}"
+        )
+
+
+
+
+class AttachmentTooLarge(ValueError):
+    """Raised when an attachment payload exceeds the configured byte cap."""
+
+    def __init__(self, size: int, limit: int):
+        self.size = int(size)
+        self.limit = int(limit)
+        limit_mb = limit / (1024 * 1024)
+        super().__init__(
+            f"attachment too large: {size} bytes exceeds {limit_mb:g} MB limit"
+        )
+
+# Maximum byte size for a single attachment stored via kanban_attach / kanban_attach_url.
+KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
+
+
 REQUIRED_COMPLETION_PROOF_FIELDS = (
     "proof_type",
     "proof",
@@ -4550,6 +4693,7 @@ def complete_task(
         metadata=metadata,
         allow_autofill=False,
     )
+    metadata = _persist_completion_artifacts(conn, task_id, metadata)
 
     # Graph-completion invariant: a parent task cannot reach 'done' while it
     # has any active (non-terminal) children. This prevents Defect 2 — a
