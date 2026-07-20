@@ -758,6 +758,79 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_submit_qa(args: dict, **kw) -> str:
+    """Atomically hand the current worker task to Motoko QA."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    evidence = args.get("evidence")
+    if not evidence or not str(evidence).strip():
+        return tool_error("evidence is required — summarize the QA handoff")
+    evidence = redact_sensitive_text(str(evidence), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.submit_qa_task(
+                conn,
+                tid,
+                evidence=evidence,
+                expected_run_id=_worker_run_id(tid),
+                board=board,
+            )
+            if not ok:
+                return tool_error(
+                    f"could not submit {tid} for QA (unknown id or not in running state)"
+                )
+            run = kb.latest_run(conn, tid)
+            return _ok(task_id=tid, run_id=run.id if run else None, status="qa_review")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_qa: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_qa failed")
+        return tool_error(f"kanban_submit_qa: {e}")
+
+
+def _handle_reject_qa(args: dict, **kw) -> str:
+    """Let Motoko return a QA review to the board as a capability block."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error("reason is required — explain what blocked QA sign-off")
+    reason = redact_sensitive_text(str(reason), force=True)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.reject_qa_task(conn, tid, reason=reason, board=board)
+            if not ok:
+                return tool_error(
+                    f"could not reject QA for {tid} (unknown id or not in qa_review state)"
+                )
+            return _ok(task_id=tid, status="blocked")
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_reject_qa: {e}")
+    except Exception as e:
+        logger.exception("kanban_reject_qa failed")
+        return tool_error(f"kanban_reject_qa: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1565,6 +1638,44 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+
+KANBAN_SUBMIT_QA_SCHEMA = {
+    "name": "kanban_submit_qa",
+    "description": (
+        "Atomically hand the current running task to Motoko QA review. The "
+        "active worker run is closed, evidence is recorded on the task, and "
+        "the task moves to qa_review with assignee motoko."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "evidence": {
+                "type": "string",
+                "description": "Short, board-recorded evidence summary for Motoko.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["evidence"],
+    },
+}
+
+
+KANBAN_REJECT_QA_SCHEMA = {
+    "name": "kanban_reject_qa",
+    "description": "Motoko returns a submitted QA review as a capability block.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "reason": {"type": "string", "description": "Reason QA sign-off is withheld."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["reason"],
+    },
+}
+
+
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
@@ -1990,6 +2101,24 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_submit_qa",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_QA_SCHEMA,
+    handler=_handle_submit_qa,
+    check_fn=_check_kanban_mode,
+    emoji="🧪",
+)
+
+registry.register(
+    name="kanban_reject_qa",
+    toolset="kanban",
+    schema=KANBAN_REJECT_QA_SCHEMA,
+    handler=_handle_reject_qa,
+    check_fn=_check_kanban_mode,
+    emoji="❌",
 )
 
 registry.register(

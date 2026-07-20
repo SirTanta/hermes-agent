@@ -551,6 +551,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_submit_qa = sub.add_parser(
+        "submit-qa",
+        aliases=["qa-submit"],
+        help="Submit a running task to Motoko QA review",
+    )
+    p_submit_qa.add_argument(
+        "task_id", nargs="?", help="Task id (defaults to $HERMES_KANBAN_TASK)"
+    )
+    p_submit_qa.add_argument(
+        "evidence", nargs="+", help="One-line evidence summary for Motoko"
+    )
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -976,6 +988,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "submit-qa": _cmd_submit_qa,
+            "qa-submit": _cmd_submit_qa,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -2008,6 +2022,31 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_submit_qa(args: argparse.Namespace) -> int:
+    tid = getattr(args, "task_id", None) or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        print("task_id is required", file=sys.stderr)
+        return 1
+    evidence = " ".join(getattr(args, "evidence", []) or []).strip()
+    if not evidence:
+        print("evidence is required", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok = kb.submit_qa_task(
+            conn,
+            tid,
+            evidence=evidence,
+            expected_run_id=_worker_run_id_for(tid),
+            board=os.environ.get("HERMES_KANBAN_BOARD"),
+        )
+        if not ok:
+            print(f"cannot submit {tid} for QA (unknown id or not running)", file=sys.stderr)
+            return 1
+        run = kb.latest_run(conn, tid)
+        print(f"Submitted {tid} for QA" + (f" (run {run.id})" if run else ""))
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
