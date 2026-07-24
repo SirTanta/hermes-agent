@@ -3596,33 +3596,15 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote only ``todo`` tasks to ``ready`` when all parents are done.
+
+    Blocked is an explicit operator hold in THOS. It never auto-promotes:
+    capability, approval, human-input, and legacy dependency holds require
+    an explicit unblock after their evidence or decision is recorded.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
-
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
-
-    2. The task's ``consecutive_failures`` has reached the effective
-       failure limit.  This prevents infinite retry loops when a task
-       repeatedly exhausts its iteration budget: without this guard the
-       counter would reset on every recovery cycle and the circuit
-       breaker could never trip (#35072).
-
-    The effective failure limit resolves in the same order as the
-    circuit breaker in ``_record_task_failure`` so the two never
-    disagree about when a task is permanently blocked:
-
-      1. per-task ``max_retries`` if set
-      2. caller-supplied ``failure_limit`` (the dispatcher passes the
-         ``kanban.failure_limit`` config value through ``dispatch_once``)
-      3. ``DEFAULT_FAILURE_LIMIT``
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -3630,7 +3612,7 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status = 'todo'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -3646,114 +3628,15 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
 
-            if cur_status == "blocked" and not _has_sticky_block(conn, task_id):
-                # Non-sticky circuit-breaker path: if all parents are done (or
-                # no parents exist), the task CAN be auto-recovered.  Skip only
-                # when parents are still open.
-                parents_done = conn.execute(
-                    "SELECT COUNT(*) AS total, "
-                    "SUM(CASE WHEN t.status IN ('done', 'archived') THEN 1 ELSE 0 END) AS done "
-                    "FROM tasks t JOIN task_links l ON l.parent_id = t.id "
-                    "WHERE l.child_id = ?",
-                    (task_id,),
-                ).fetchone()
-                if parents_done["total"] > 0 and parents_done["done"] != parents_done["total"]:
-                    continue
-
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # ``_has_sticky_block`` is True when block_kind is set and
-                # block_recurrences >= STICKY_BLOCK_THRESHOLD. These tasks
-                # require an explicit kanban_unblock to exit.
-                row_bk = conn.execute(
-                    "SELECT block_kind, dependency_blocked FROM tasks WHERE id = ?",
-                    (task_id,),
-                ).fetchone()
-                dep_blocked = (
-                    row_bk["dependency_blocked"]
-                    if row_bk and "dependency_blocked" in row_bk.keys()
-                    else 0
-                )
-
-                # dependency_blocked=1: parked on a dependency-kind block —
-                # requires explicit kanban_unblock even after parents complete.
-                # This prevents the observer-respawn loop (Defect 5).
-                if dep_blocked:
-                    continue
-
-                # For non-dependency sticky blocks (capability / needs_input /
-                # transient): hold only if parents are still open.
-                # If all parents are done, allow through so the sticky block
-                # fingerprint can be cleared by the normal parent-completion path.
-                if row_bk["block_kind"] and row_bk["block_kind"] != "dependency":
-                    parents_done = conn.execute(
-                        "SELECT COUNT(*) AS total, "
-                        "SUM(CASE WHEN t.status IN ('done', 'archived') THEN 1 ELSE 0 END) AS done "
-                        "FROM tasks t JOIN task_links l ON l.parent_id = t.id "
-                        "WHERE l.child_id = ?",
-                        (task_id,),
-                    ).fetchone()
-                    if parents_done["total"] > 0 and parents_done["done"] != parents_done["total"]:
-                        continue
-                # Otherwise fall through to the normal parent-completion check.
             if all(p["status"] in ("done", "archived") for p in parents):
                 assignee_row = conn.execute(
                     "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
                 ).fetchone()
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    # Separate two distinct release paths:
-                    #
-                    # 1. STICKY BLOCK (dependency / needs_input / capability /
-                    #    transient): the block was placed by a worker via
-                    #    ``kanban_block`` and persists until human unblock.
-                    #    When it IS auto-released here (all parents completed
-                    #    for a dependency block), the blocking condition is
-                    #    gone — the next block event (if any) will carry a
-                    #    fresh fingerprint.  We must RESET, not increment,
-                    #    so the circuit breaker cannot be tripped by a
-                    #    phantom advance from this non-event release.
-                    #
-                    # 2. NON-STICKY BLOCK (circuit-breaker gave_up): the
-                    #    task blocked without a sticky fingerprint, so
-                    #    fingerprint_count is already >= 1.  Each
-                    #    auto-recovery bumps the counter so the breaker
-                    #    can accumulate across repeated failure cycles.
-                    if _has_sticky_block(conn, task_id):
-                        conn.execute(
-                            "UPDATE tasks SET status = 'ready', "
-                            "last_block_fingerprint = NULL, "
-                            "block_fingerprint_count = 0 "
-                            "WHERE id = ? AND status = 'blocked'",
-                            (task_id,),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE tasks SET status = 'ready', "
-                            "block_fingerprint_count = block_fingerprint_count + 1 "
-                            "WHERE id = ? AND status = 'blocked'",
-                            (task_id,),
-                        )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' "
+                    "WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
                 _append_event(conn, task_id, "promoted", None)
                 _fire_kanban_lifecycle_hook(
                     "kanban_task_ready",
