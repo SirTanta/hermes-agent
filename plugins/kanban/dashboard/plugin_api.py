@@ -665,11 +665,31 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
 # implementation and cannot drift. ``_safe_attachment_name`` raises a plain
 # ``ValueError`` there; the upload handler's ``except ValueError`` below maps
 # it to a 400, preserving the previous response.
-from hermes_cli.kanban_db import (  # noqa: E402
-    KANBAN_ATTACHMENT_MAX_BYTES,
-    _collision_free_path,
-    _safe_attachment_name,
-)
+try:  # noqa: E402
+    from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES
+except ImportError:
+    KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+try:  # noqa: E402
+    from hermes_cli.kanban_db import _safe_attachment_name
+except ImportError:
+    def _safe_attachment_name(filename: str) -> str:
+        raw = Path(filename or "").name.strip()
+        cleaned = "".join(ch if ch.isalnum() or ch in "._- ()" else "_" for ch in raw).strip(" .")
+        if not cleaned or cleaned in {".", ".."}:
+            raise ValueError("invalid attachment filename")
+        return cleaned[:180]
+try:  # noqa: E402
+    from hermes_cli.kanban_db import _collision_free_path
+except ImportError:
+    def _collision_free_path(directory: Path, filename: str) -> Path:
+        candidate = directory / filename
+        if not candidate.exists():
+            return candidate
+        for index in range(1, 10000):
+            candidate = directory / f"{Path(filename).stem} ({index}){Path(filename).suffix}"
+            if not candidate.exists():
+                return candidate
+        raise ValueError(f"could not find free attachment path for {filename!r}")
 
 
 @router.get("/tasks/{task_id}/attachments")

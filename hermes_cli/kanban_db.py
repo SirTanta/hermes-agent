@@ -8679,37 +8679,33 @@ def _dispatch_once_locked(
                 _ac_exc,
             )
 
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
-
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.escalated_to_triage = escalate_stale_blocked_to_triage(
-        conn, stale_blocked_seconds=stale_blocked_seconds,
-    )
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # A dry run must be a pure preview. Reclaim, timeout, escalation, and
+    # todo->ready promotion all write task state, so none may execute here.
+    if not dry_run:
+        # Reap zombie children from previously spawned workers. See
+        # reap_worker_zombies() for the full rationale.
+        reap_worker_zombies()
+        result.reclaimed = release_stale_claims(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.escalated_to_triage = escalate_stale_blocked_to_triage(
+            conn, stale_blocked_seconds=stale_blocked_seconds,
+        )
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8726,11 +8722,25 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
+    # THOS dispatch policy: only direct, unblocked root work assigned to an
+    # explicitly allowed live profile may enter worker dispatch. Kanban is
+    # routing metadata, not a parent/child execution engine.
+    allowed_raw = os.environ.get("HERMES_KANBAN_DISPATCH_ALLOWED_PROFILES", "")
+    allowed_profiles = [p.strip().lower() for p in allowed_raw.split(",") if p.strip()]
+    ready_sql = (
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+        "AND COALESCE(dependency_blocked, 0) = 0 "
+        "AND COALESCE(block_kind, '') = '' "
+        "AND COALESCE(max_children, 0) = 0 "
+        "AND NOT EXISTS (SELECT 1 FROM task_links WHERE child_id = tasks.id) "
+    )
+    ready_params: list[str] = []
+    if allowed_profiles:
+        ready_sql += "AND lower(COALESCE(assignee, '')) IN (" + ",".join("?" for _ in allowed_profiles) + ") "
+        ready_params.extend(allowed_profiles)
+    ready_sql += "ORDER BY priority DESC, created_at ASC"
+    ready_rows = conn.execute(ready_sql, ready_params).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
