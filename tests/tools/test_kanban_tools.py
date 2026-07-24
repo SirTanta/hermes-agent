@@ -1582,6 +1582,9 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
+    # The dispatcher chooses the board; workers must not inherit a stale path.
+    assert "HERMES_KANBAN_DB" in prompt
+    assert "~/.hermes/kanban.db" not in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):

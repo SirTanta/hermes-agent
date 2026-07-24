@@ -22,7 +22,7 @@ Scope (what we expose):
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
-    unblock/link)                          write ~/.hermes/kanban.db)
+    unblock/link)                          write through the dispatcher-resolved Kanban environment)
 
 What we DO NOT expose:
   - terminal / shell                     — codex's own shell tool
@@ -132,7 +132,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     # in the callback, a worker spawned with openai_runtime=codex_app_server
     # could do the work but couldn't report completion back to the kernel,
     # making it hang until timeout. Stateless dispatch — they just read
-    # the env var and write to ~/.hermes/kanban.db.
+    # the environment and resolve the canonical board at runtime.
     "kanban_complete",
     "kanban_block",
     "kanban_comment",
