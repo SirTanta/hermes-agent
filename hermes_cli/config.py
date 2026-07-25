@@ -2911,6 +2911,15 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Optional proof gate for terminal completion. When enabled, every
+        # completion must supply a concise summary, a receipt, and explicit
+        # next_state=done. Disabled by default for upstream compatibility.
+        "completion_contract": {
+            "enabled": False,
+            "max_summary_chars": 400,
+            "require_evidence": True,
+            "require_next_state": True,
+        },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

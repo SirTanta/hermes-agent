@@ -673,6 +673,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
                 )
+            except kb.CompletionContractError as contract_err:
+                return tool_error(
+                    f"kanban_complete blocked: {contract_err}. Your task is "
+                    "still in-flight. Supply the missing verified-result "
+                    "fields and retry without changing the task state."
+                )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
                     f"kanban_complete could not preserve the declared artifacts: "
@@ -1514,7 +1520,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
+        "tests_run, decisions, findings, etc). When the board completion "
+        "contract is enabled, provide a concise single-line ``summary``, "
+        "``metadata.evidence`` as receipt URLs or receipt objects, and "
+        "``metadata.next_state`` set to ``done``. At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "

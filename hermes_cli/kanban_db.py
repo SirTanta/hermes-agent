@@ -4592,6 +4592,68 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class CompletionContractError(ValueError):
+    """Raised when an enabled verified-result completion gate is unmet."""
+
+    def __init__(self, missing: list[str]):
+        self.missing = missing
+        super().__init__("completion contract requires: " + ", ".join(missing))
+
+
+def _completion_contract() -> dict[str, Any]:
+    """Return the active profile's opt-in completion contract."""
+    try:
+        from hermes_cli.config import load_config
+        contract = (load_config().get("kanban") or {}).get(
+            "completion_contract"
+        ) or {}
+        return contract if isinstance(contract, dict) else {}
+    except Exception:
+        return {}
+
+
+def _validate_completion_contract(
+    summary: Optional[str], metadata: Optional[dict], contract: dict[str, Any]
+) -> None:
+    """Validate the opt-in verified-result handoff before any DB mutation."""
+    if not bool(contract.get("enabled", False)):
+        return
+
+    missing: list[str] = []
+    summary_text = str(summary or "").strip()
+    try:
+        max_summary_chars = max(1, int(contract.get("max_summary_chars", 400)))
+    except (TypeError, ValueError):
+        max_summary_chars = 400
+    if not summary_text:
+        missing.append("summary")
+    elif "\n" in summary_text or len(summary_text) > max_summary_chars:
+        missing.append(f"summary (single line, <= {max_summary_chars} chars)")
+
+    if bool(contract.get("require_evidence", True)):
+        evidence = metadata.get("evidence") if isinstance(metadata, dict) else None
+        receipts = evidence if isinstance(evidence, list) else []
+        valid_receipt = any(
+            (isinstance(item, str) and item.strip().startswith("https://"))
+            or (
+                isinstance(item, dict)
+                and isinstance(item.get("receipt"), str)
+                and bool(item["receipt"].strip())
+            )
+            for item in receipts
+        )
+        if not valid_receipt:
+            missing.append("metadata.evidence")
+
+    if bool(contract.get("require_next_state", True)):
+        next_state = metadata.get("next_state") if isinstance(metadata, dict) else None
+        if next_state != "done":
+            missing.append("metadata.next_state=done")
+
+    if missing:
+        raise CompletionContractError(missing)
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4662,6 +4724,8 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    _validate_completion_contract(summary, metadata, _completion_contract())
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
