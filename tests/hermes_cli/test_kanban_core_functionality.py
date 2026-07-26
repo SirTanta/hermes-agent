@@ -3859,6 +3859,30 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     assert calls["tick"] == 3
 
 
+def test_completion_contract_accepts_structured_local_artifact_evidence():
+    contract = {"enabled": True, "require_evidence": True, "require_next_state": True}
+    kb._validate_completion_contract(
+        "verified no-write packet",
+        {
+            "evidence": {
+                "path": "/tmp/no-write-packet.md",
+                "sha256": "a" * 64,
+            },
+            "next_state": "done",
+        },
+        contract,
+    )
+
+
+def test_completion_contract_accepts_direct_receipt_object():
+    contract = {"enabled": True, "require_evidence": True, "require_next_state": True}
+    kb._validate_completion_contract(
+        "verified receipt",
+        {"evidence": {"receipt": "local:verified"}, "next_state": "done"},
+        contract,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hallucination gate (created_cards verify + prose scan)
 # ---------------------------------------------------------------------------

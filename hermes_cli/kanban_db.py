@@ -4632,17 +4632,35 @@ def _validate_completion_contract(
 
     if bool(contract.get("require_evidence", True)):
         evidence = metadata.get("evidence") if isinstance(metadata, dict) else None
-        receipts = evidence if isinstance(evidence, list) else []
-        valid_receipt = any(
-            (isinstance(item, str) and item.strip().startswith("https://"))
-            or (
-                isinstance(item, dict)
-                and isinstance(item.get("receipt"), str)
-                and bool(item["receipt"].strip())
+        # Workers may return a single receipt object, a receipt list, or a
+        # local no-write artifact backed by a SHA-256 digest.
+        if isinstance(evidence, list):
+            receipts = evidence
+        elif isinstance(evidence, (str, dict)):
+            receipts = [evidence]
+        else:
+            receipts = []
+
+        def _valid_receipt(item: Any) -> bool:
+            if isinstance(item, str):
+                ref = item.strip()
+                return ref.startswith("https://") or ref.startswith("file://")
+            if not isinstance(item, dict):
+                return False
+            receipt = item.get("receipt")
+            if isinstance(receipt, str) and receipt.strip():
+                return True
+            path = item.get("path") or item.get("artifact")
+            digest = item.get("sha256")
+            return (
+                isinstance(path, str)
+                and path.startswith("/")
+                and isinstance(digest, str)
+                and len(digest) == 64
+                and all(ch in "0123456789abcdefABCDEF" for ch in digest)
             )
-            for item in receipts
-        )
-        if not valid_receipt:
+
+        if not any(_valid_receipt(item) for item in receipts):
             missing.append("metadata.evidence")
 
     if bool(contract.get("require_next_state", True)):
