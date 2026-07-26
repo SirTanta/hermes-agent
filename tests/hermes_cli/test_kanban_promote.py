@@ -149,6 +149,31 @@ def test_promote_rejects_unknown_task(conn):
     assert err is not None and "not found" in err
 
 
+def test_qualified_triage_promotion_requires_raphael_gateway_proof(conn):
+    tid = kb.create_task(conn, title="qualified", assignee="nanao")
+    conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+    ok, err = kb.promote_task(conn, tid, actor="raphael", qualified=True, reason="gateway verified: nanao live")
+    assert ok and err is None
+    assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_qualified_triage_promotion_rejects_unverified_actor(conn):
+    tid = kb.create_task(conn, title="qualified", assignee="nanao")
+    conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+    ok, err = kb.promote_task(conn, tid, actor="deed", qualified=True, reason="gateway verified: nanao live")
+    assert ok is False
+    assert "restricted to Raphael" in err
+    assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_qualified_triage_promotion_requires_gateway_reason(conn):
+    tid = kb.create_task(conn, title="qualified", assignee="nanao")
+    conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+    ok, err = kb.promote_task(conn, tid, actor="raphael", qualified=True, reason="owner available")
+    assert ok is False
+    assert "gateway-proof" in err
+
+
 def test_promote_blocked_task_works(conn):
     tid = kb.create_task(conn, title="t")
     conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))

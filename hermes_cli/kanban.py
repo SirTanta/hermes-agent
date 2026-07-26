@@ -636,7 +636,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+        help="Manually move todo/blocked tasks, or Raphael-qualified triage, to ready",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(
@@ -654,6 +654,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--force",
         action="store_true",
         help="Promote even if parent dependencies are not yet done/archived",
+    )
+    p_promote.add_argument(
+        "--qualified",
+        action="store_true",
+        help="Raphael-only triage promotion; requires a gateway-proof reason",
     )
     p_promote.add_argument(
         "--dry-run",
@@ -2342,6 +2347,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 actor=author,
                 reason=reason,
                 force=bool(args.force),
+                qualified=bool(getattr(args, "qualified", False)),
                 dry_run=bool(args.dry_run),
             )
             results.append({
