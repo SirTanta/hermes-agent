@@ -7599,28 +7599,41 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # failure budget, just as other failure kinds don't
                     # consume this one.
                     continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
-                )
-                if tripped:
-                    auto_blocked.append(tid)
+                # A repeated clean exit without its terminal Kanban action is
+                # an execution-protocol defect, not a genuine external
+                # prerequisite. Keep the same root card and route it to the
+                # dispatcher for evidence-based recovery.
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'triage', assignee = 'raphael', "
+                        "consecutive_failures = 0 WHERE id = ? AND status = 'ready'",
+                        (tid,),
+                    )
+                    if cur.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_comments (task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                tid,
+                                "system",
+                                "Protocol recovery: worker exited cleanly without a terminal "
+                                "Kanban action after the bounded retry budget. Assigned to "
+                                "Raphael triage to verify any artifact and re-route the same root card.",
+                                int(time.time()),
+                            ),
+                        )
+                        _append_event(
+                            conn,
+                            tid,
+                            "protocol_escalated_to_triage",
+                            {
+                                "pid": pid,
+                                "claimer": claimer,
+                                "protocol_violations": streak,
+                                "protocol_violation_limit": violation_limit,
+                                "assignee": "raphael",
+                            },
+                        )
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
