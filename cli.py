@@ -4395,8 +4395,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._background_task_counter = 0
 
     def _claim_active_session(self, surface: str = "cli", *, stderr: bool = False) -> bool:
-        """Claim a global active-session slot for this CLI process."""
+        """Claim a global active-session slot for this CLI process.
+
+        Dispatcher-spawned kanban workers (HERMES_KANBAN_TASK set, the same
+        marker used fleet-wide to identify this context -- see kanban_db.py's
+        spawn env setup) are not interactive chat; they must not compete with
+        live chat sessions on the same profile for the same slot pool. Without
+        this, a profile whose slots are saturated by long-lived chat threads
+        rejects every worker spawn outright (#exit 1, active session limit),
+        which the dispatcher's failure-routing correctly (but misleadingly)
+        reports as a crash.
+        """
         if self._active_session_lease is not None:
+            return True
+        if os.environ.get("HERMES_KANBAN_TASK"):
             return True
         try:
             from hermes_cli.active_sessions import try_acquire_active_session
