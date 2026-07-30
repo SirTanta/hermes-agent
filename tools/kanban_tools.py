@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -617,6 +618,24 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
+
+            # A declared local artifact is durable evidence.  Synthesize the
+            # SHA-256 receipt required by the verified-result contract so
+            # workers do not need a fragile second tool call just to restate
+            # the same file they already handed off.
+            if not metadata.get("evidence"):
+                receipts: list[dict[str, str]] = []
+                for artifact_path in artifacts:
+                    try:
+                        with open(artifact_path, "rb") as artifact_file:
+                            digest = hashlib.sha256(artifact_file.read()).hexdigest()
+                    except OSError:
+                        continue
+                    receipts.append(
+                        {"artifact": artifact_path, "sha256": digest}
+                    )
+                if receipts:
+                    metadata["evidence"] = receipts
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"

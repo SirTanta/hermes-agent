@@ -4745,6 +4745,35 @@ def complete_task(
 
     _validate_completion_contract(summary, metadata, _completion_contract())
 
+    # Atlas-backed work has a second durable system of record.  A worker may
+    # only close a card that carries an explicit Atlas ticket UUID after the
+    # signed Atlas return has succeeded and its receipt is included in the
+    # completion metadata.  Older cards without a UUID remain compatible;
+    # new Raphael dispatches must include ``Atlas ticket UUID: <uuid>``.
+    task_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    task_body = (task_row["body"] or "") if task_row else ""
+    atlas_ticket_match = re.search(
+        r"Atlas ticket UUID:\\s*([0-9a-fA-F-]{36})", task_body
+    )
+    if atlas_ticket_match:
+        atlas_receipt = (
+            metadata.get("atlas_return_receipt")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(atlas_receipt, str) or not atlas_receipt.strip():
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_missing_atlas_return",
+                    {
+                        "atlas_ticket_id": atlas_ticket_match.group(1),
+                        "required_metadata": "atlas_return_receipt",
+                    },
+                )
+            raise CompletionContractError(["metadata.atlas_return_receipt"])
+
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -7740,6 +7769,64 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
+            # A worker process failure is not evidence of a business-side
+            # prerequisite.  Provider transport faults, a no-byte timeout,
+            # and local spawn failures previously landed in ``blocked`` with
+            # the same label used for real human/credential/provider gates.
+            # Keep the same root card, but route it to the recovery supervisor
+            # for evidence-based reassignment instead.  Only an explicit
+            # worker ``kanban_block`` can create a genuine blocked card.
+            if outcome in {"crashed", "timed_out", "spawn_failed"}:
+                technical_payload = {
+                    "failures": failures,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "error": error[:500],
+                    "trigger_outcome": outcome,
+                    "recovery_owner": "misa",
+                }
+                if event_payload_extra:
+                    technical_payload.update(event_payload_extra)
+                if release_claim:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'triage', assignee = 'misa', "
+                        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status IN ('running', 'ready')",
+                        (failures, error[:500], task_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'triage', assignee = 'misa', "
+                        "consecutive_failures = ?, last_failure_error = ? "
+                        "WHERE id = ? AND status IN ('ready', 'running')",
+                        (failures, error[:500], task_id),
+                    )
+                if end_run:
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="technical_recovery", status="triage",
+                        error=error[:500], metadata=technical_payload,
+                    )
+                else:
+                    run_id = None
+                _append_event(
+                    conn, task_id, "technical_recovery", technical_payload,
+                    run_id=run_id,
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "system",
+                        "Technical recovery required: provider/session/spawn failure "
+                        "exhausted its retry budget. Misa must inspect the evidence and "
+                        "reassign this same root card. This is not an external blocker.",
+                        int(time.time()),
+                    ),
+                )
+                return False
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.

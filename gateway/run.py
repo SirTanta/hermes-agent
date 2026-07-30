@@ -5905,6 +5905,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Try again when another session finishes."
         )
 
+    def _bypasses_active_session_limit(self, source: SessionSource) -> bool:
+        """Return whether an authorized Telegram control lane bypasses worker slots.
+
+        The global cap protects agent-worker capacity. A configured Telegram
+        control lane is still serialized by ``_running_agents`` per session,
+        but must be able to accept executive input while workers are busy.
+        """
+        if source.platform != Platform.TELEGRAM:
+            return False
+        platforms = getattr(getattr(self, "config", None), "platforms", {}) or {}
+        telegram_config = platforms.get(Platform.TELEGRAM)
+        extra = getattr(telegram_config, "extra", {}) or {}
+        return bool(
+            isinstance(extra, dict)
+            and extra.get("bypass_active_session_limit", False)
+        )
+
     def _claim_active_session_slot(
         self,
         session_key: str,
@@ -5912,6 +5929,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
         if session_key in getattr(self, "_running_agents", {}):
+            return None, None
+        if self._bypasses_active_session_limit(source):
             return None, None
         local_limit_message = self._active_session_limit_message(session_key)
         if local_limit_message is not None:
