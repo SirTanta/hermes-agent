@@ -5926,11 +5926,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         session_key: str,
         source: SessionSource,
+        is_internal: bool = False,
     ) -> tuple[Any, Optional[str]]:
-        """Claim a cross-process active-session slot for a new gateway turn."""
+        """Claim a cross-process active-session slot for a new gateway turn.
+
+        Internal/system-forged turns (kanban dispatch, wake events, restart
+        replays) are not user-initiated chat and must still flow while the
+        cap is saturated by live interactive sessions on the same profile
+        -- same reasoning as the external-drain gate above, which already
+        exempts them. Without this, background business work (e.g. a
+        kanban dispatcher spawning a worker turn) can starve indefinitely
+        behind long-lived chat threads and get misclassified as a crash.
+        """
         if session_key in getattr(self, "_running_agents", {}):
             return None, None
-        if self._bypasses_active_session_limit(source):
+        if is_internal or self._bypasses_active_session_limit(source):
             return None, None
         local_limit_message = self._active_session_limit_message(session_key)
         if local_limit_message is not None:
@@ -12257,6 +12267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _active_session_lease, _limit_message = self._claim_active_session_slot(
             _quick_key,
             source,
+            is_internal=is_internal,
         )
         if _limit_message is not None:
             logger.info(
