@@ -2706,7 +2706,8 @@ def _run_approval_gate(
         try:
             from tools.terminal_tool import _get_approval_callback
             approval_callback = _get_approval_callback()
-        except Exception:
+        except Exception as exc:
+            logger.debug("Approval callback unavailable: %s", exc)
             approval_callback = None
 
     is_cli = _is_interactive_cli()
@@ -3289,8 +3290,8 @@ def check_all_command_guards(command: str, env_type: str,
                         _sec = (_load_cfg() or {}).get("security", {}) or {}
                         if _sec.get("tirith_enabled", True):
                             _cron_fail_open = _sec.get("tirith_fail_open", True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed to load security config: %s", exc, exc_info=True)
                     if not _cron_fail_open:
                         return {
                             "approved": False,
