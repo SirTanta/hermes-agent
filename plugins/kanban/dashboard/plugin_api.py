@@ -167,11 +167,13 @@ def _task_dict(
         d["age"] = kanban_db.task_age(task)
     except Exception:
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
-    # Surface the latest non-null run summary so dashboards don't show
-    # blank cards/drawers for tasks where the worker handed off via
-    # ``task_runs.summary`` (the kanban-worker pattern) instead of
-    # ``tasks.result``. ``None`` when no run has produced a summary yet.
-    d["latest_summary"] = latest_summary
+    # A run summary is a current final-result fallback only while the task
+    # itself is terminal. A reopened/reworked task can retain completed run
+    # attempts, but those attempts must not override the authoritative
+    # ``tasks.status`` read model or render as the task's current result.
+    is_terminal = task.status in {"done", "archived"}
+    d["latest_summary"] = latest_summary if is_terminal else None
+    d["historical_latest_summary"] = latest_summary if not is_terminal else None
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -558,7 +560,16 @@ def get_task(
                 "id": child.id,
                 "title": child.title,
                 "status": child.status,
-                "latest_summary": child_summaries.get(child.id),
+                "latest_summary": (
+                    child_summaries.get(child.id)
+                    if child.status in {"done", "archived"}
+                    else None
+                ),
+                "historical_latest_summary": (
+                    child_summaries.get(child.id)
+                    if child.status not in {"done", "archived"}
+                    else None
+                ),
                 "result": child.result,
             })
         # Attach diagnostics so the drawer's Diagnostics section can

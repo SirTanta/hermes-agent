@@ -2462,6 +2462,36 @@ def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
     assert data["latest_summary"] == "Report written to /output/report.md"
 
 
+def test_reopened_task_keeps_completed_run_summary_in_history_only(client):
+    """A terminal attempt must not render as the current result after rework."""
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="Reopened task with completed attempt")
+    kb.claim_task(conn, task_id)
+    kb.complete_task(conn, task_id, summary="Historical completed attempt")
+    conn.execute(
+        "UPDATE tasks SET status = 'triage', completed_at = NULL, "
+        "current_run_id = NULL WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["task"]["status"] == "triage"
+    assert payload["task"]["latest_summary"] is None
+    assert payload["task"]["historical_latest_summary"] == "Historical completed attempt"
+    assert payload["runs"][-1]["status"] == "done"
+    assert payload["runs"][-1]["summary"] == "Historical completed attempt"
+
+    board = client.get("/api/plugins/kanban/board").json()
+    triage = next(column for column in board["columns"] if column["name"] == "triage")
+    card = next(task for task in triage["tasks"] if task["id"] == task_id)
+    assert card["latest_summary"] is None
+    assert card["historical_latest_summary"] == "Historical completed attempt"
+
+
 def test_task_detail_latest_summary_none_when_nothing_recorded(client):
     """When no run summary exists, the existing field remains None."""
     r = client.post(
@@ -2494,7 +2524,7 @@ def test_dashboard_done_final_result_section_rendered_from_summary():
     """Frontend must render Final Result section from run summary when task.result is empty."""
     repo_root = Path(__file__).resolve().parents[2]
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-    assert "t.result || t.latest_summary" in dist
+    assert "t.result || (isDone ? t.latest_summary : null)" in dist
     assert "Final Result (run summary)" in dist
     assert "No final result was recorded" in dist
     assert "orchestrator" in dist or "parent task" in dist
@@ -2530,7 +2560,7 @@ def test_dashboard_final_result_uses_existing_fields_without_alias():
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
     api = (repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py").read_text()
 
-    assert "var finalResult = t.result || t.latest_summary || null;" in dist
+    assert "var finalResult = t.result || (isDone ? t.latest_summary : null) || null;" in dist
     assert "t.final_result" not in dist
     assert 'd["final_result"]' not in api
 

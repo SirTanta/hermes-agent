@@ -48,10 +48,19 @@ def _make_event(text: str = "hello", chat_id: str = "chat-1") -> MessageEvent:
     )
 
 
-def _make_runner(max_concurrent_sessions: int | None = None) -> GatewayRunner:
+def _make_runner(
+    max_concurrent_sessions: int | None = None,
+    telegram_control_lane: bool = False,
+) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={"bypass_active_session_limit": telegram_control_lane},
+            )
+        },
         max_concurrent_sessions=max_concurrent_sessions,
     )
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
@@ -137,6 +146,26 @@ def test_existing_active_session_uses_busy_handling_at_limit(monkeypatch):
 
     assert result is None
     assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key] is event
+
+
+def test_telegram_control_lane_can_start_while_worker_slots_are_full(monkeypatch):
+    _silence_global_gateway_hooks(monkeypatch)
+    runner = _make_runner(max_concurrent_sessions=1, telegram_control_lane=True)
+    _occupy_session(runner, "busy")
+    event = _make_event(chat_id="executive")
+
+    sentinel_seen = False
+
+    async def mock_agent_run(self_inner, ev, src, qk, generation):
+        nonlocal sentinel_seen
+        sentinel_seen = runner._running_agents.get(qk) is _AGENT_PENDING_SENTINEL
+        return "received"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_agent_run):
+        result = asyncio.run(runner._handle_message(event))
+
+    assert result == "received"
+    assert sentinel_seen is True
 
 
 def test_new_session_can_start_after_active_session_released(monkeypatch):

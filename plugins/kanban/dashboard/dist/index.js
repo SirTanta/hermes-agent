@@ -703,7 +703,7 @@
         if (tenantFilter && t.tenant !== tenantFilter) return false;
         if (assigneeFilter && t.assignee !== assigneeFilter) return false;
         if (q) {
-          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
+          const hay = `${t.id} ${t.title || ""} ${t.body || ""} ${t.result || ""} ${t.latest_summary || ""} ${t.historical_latest_summary || ""} ${t.assignee || ""} ${t.tenant || ""}`.toLowerCase();
           if (hay.indexOf(q) === -1) return false;
         }
         return true;
@@ -3629,8 +3629,8 @@
         onRemoveChild: props.onRemoveChild,
       }),
       (function () {
-        var finalResult = t.result || t.latest_summary || null;
         var isDone = t.status === "done";
+        var finalResult = t.result || (isDone ? t.latest_summary : null) || null;
         var isParent = links.children.length > 0;
         if (finalResult) {
           var label = t.result
@@ -3665,7 +3665,7 @@
         h("div", { className: "hermes-kanban-section-head" },
           `${tx(i18n, "childResults", "Child Results")} (${childResults.length})`),
         childResults.map(function (child) {
-          var childResult = child.result || child.latest_summary || null;
+          var childResult = child.result || (child.status === "done" ? child.latest_summary : null) || null;
           return h("div", { key: child.id, className: "hermes-kanban-comment" },
             h("div", { className: "hermes-kanban-comment-head" },
               h("span", { className: "hermes-kanban-comment-author" },

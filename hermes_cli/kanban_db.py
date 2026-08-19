@@ -102,6 +102,21 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Atlas creates a canonical Hermes card before it registers the immutable
+# cross-system link.  That control-boundary card must remain non-dispatchable
+# until registration succeeds.  Requiring both exact markers avoids treating
+# ordinary tasks that mention either phrase as control-plane holds.
+_ATLAS_REGISTRATION_PENDING_MARKERS = (
+    "Boundary: canonical card creation only",
+    "Do not dispatch or start a worker until the next explicit control-test authorization.",
+)
+
+
+def _is_atlas_registration_pending(body: Optional[str]) -> bool:
+    """Return True only for the exact Atlas registration-pending card contract."""
+    text = body or ""
+    return all(marker in text for marker in _ATLAS_REGISTRATION_PENDING_MARKERS)
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -3895,6 +3910,63 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _is_verified_motoko_qa_child(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return True only for the canonical QA child of a verified return."""
+    rows = conn.execute(
+        "SELECT c.assignee AS child_assignee, "
+        "c.idempotency_key AS child_key, "
+        "p.id AS parent_id, p.idempotency_key AS parent_key, "
+        "p.current_step_key AS parent_step, p.current_run_id AS parent_run, "
+        "p.claim_lock AS parent_lock, p.worker_pid AS parent_worker "
+        "FROM tasks c "
+        "JOIN task_links l ON l.child_id = c.id "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE c.id = ?",
+        (task_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    if (
+        (row["child_assignee"] or "").lower() != "motoko"
+        or not row["parent_key"]
+        or row["parent_step"] != "awaiting_motoko_qa"
+        or row["parent_run"] is not None
+        or row["parent_lock"] is not None
+        or row["parent_worker"] is not None
+    ):
+        return False
+    key_parts = (row["child_key"] or "").split(":")
+    if (
+        len(key_parts) != 4
+        or key_parts[0] != row["parent_key"]
+        or key_parts[1] != row["parent_id"]
+        or not key_parts[2].isdigit()
+        or key_parts[3] != "motoko_qa"
+    ):
+        return False
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'raphael_return_verified' "
+        "ORDER BY id DESC LIMIT 1",
+        (row["parent_id"],),
+    ).fetchone()
+    if not event or not event["payload"]:
+        return False
+    try:
+        payload = json.loads(event["payload"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        payload.get("atlas_ticket_id") == row["parent_key"]
+        and payload.get("qa_card_id") == task_id
+        and payload.get("attempt") == int(key_parts[2])
+        and payload.get("business_terminal") is False
+    )
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3949,7 +4021,10 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if (
+                all(p["status"] in ("done", "archived") for p in parents)
+                or _is_verified_motoko_qa_child(conn, task_id)
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4002,6 +4077,31 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Atlas control-boundary cards are created before the immutable Atlas
+        # link is registered.  Refuse every claim path while the exact
+        # registration-pending contract remains on the card.  If an external
+        # writer accidentally promoted it to ready, park it back in scheduled
+        # within the same transaction so the always-on dispatcher cannot race
+        # a worker spawn ahead of Atlas registration.
+        boundary = conn.execute(
+            "SELECT status, body FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if boundary and _is_atlas_registration_pending(boundary["body"]):
+            if boundary["status"] == "ready":
+                conn.execute(
+                    "UPDATE tasks SET status = 'scheduled' "
+                    "WHERE id = ? AND status = 'ready' AND current_run_id IS NULL",
+                    (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {
+                        "reason": "atlas_registration_pending",
+                        "source": "claim_guard",
+                    },
+                )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4010,13 +4110,14 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        verified_qa_child = _is_verified_motoko_qa_child(conn, task_id)
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
             "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
-        if undone:
+        if undone and not verified_qa_child:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -4755,9 +4856,34 @@ def complete_task(
     ).fetchone()
     task_body = (task_row["body"] or "") if task_row else ""
     atlas_ticket_match = re.search(
-        r"Atlas ticket UUID:\\s*([0-9a-fA-F-]{36})", task_body
+        r"Atlas ticket UUID:\s*([0-9a-fA-F-]{36})", task_body
     )
     if atlas_ticket_match:
+        # A worker may prepare a completion proposal, but it cannot make the
+        # canonical Atlas-backed card terminal. The same-card return must be
+        # explicitly verified by Raphael first and recorded as a native event.
+        requires_raphael_verification = (
+            "Completion contract: worker proposal -> Raphael verification/return"
+            in task_body
+        )
+        if requires_raphael_verification:
+            verified = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'raphael_return_verified' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if not verified:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "completion_proposal_required",
+                        {
+                            "atlas_ticket_id": atlas_ticket_match.group(1),
+                            "required_event": "raphael_return_verified",
+                        },
+                    )
+                raise CompletionContractError(
+                    ["task_event.raphael_return_verified"]
+                )
         atlas_receipt = (
             metadata.get("atlas_return_receipt")
             if isinstance(metadata, dict)
@@ -5725,7 +5851,8 @@ def promote_task(
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
     entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
+    state (`done`/`archived`) unless ``force=True`` or this is the exact
+    receipt-bound Motoko QA child of a verified Raphael return. Does NOT change
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
@@ -5750,7 +5877,7 @@ def promote_task(
             f"'todo', 'blocked', or qualified triage"
         )
 
-    if not force:
+    if not force and not _is_verified_motoko_qa_child(conn, task_id):
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
@@ -8121,10 +8248,11 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT DISTINCT assignee, body FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
+    rows = [row for row in rows if not _is_atlas_registration_pending(row["body"])]
     if not rows:
         return False
     try:
@@ -8320,7 +8448,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -8376,6 +8504,27 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        if _is_atlas_registration_pending(row["body"]):
+            result.respawn_guarded.append(
+                (row["id"], "atlas_registration_pending")
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    parked = conn.execute(
+                        "UPDATE tasks SET status = 'scheduled' "
+                        "WHERE id = ? AND status = 'ready' "
+                        "AND claim_lock IS NULL AND current_run_id IS NULL",
+                        (row["id"],),
+                    )
+                    if parked.rowcount == 1:
+                        _append_event(
+                            conn, row["id"], "claim_rejected",
+                            {
+                                "reason": "atlas_registration_pending",
+                                "source": "dispatcher_selection_guard",
+                            },
+                        )
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]

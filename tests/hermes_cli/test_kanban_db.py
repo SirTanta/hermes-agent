@@ -409,6 +409,80 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+def test_claim_guard_parks_atlas_registration_pending_card(kanban_home):
+    body = (
+        "Atlas ticket: ATL-TEST\n"
+        "Boundary: canonical card creation only\n"
+        "Do not dispatch or start a worker until the next explicit control-test authorization."
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="control boundary",
+            body=body,
+            assignee="raphael",
+        )
+        assert kb.get_task(conn, task_id).status == "ready"
+
+        assert kb.claim_task(conn, task_id, claimer="test:claim") is None
+        task = kb.get_task(conn, task_id)
+        assert task.status == "scheduled"
+        assert task.current_run_id is None
+        events = kb.list_events(conn, task_id)
+        assert any(
+            event.kind == "claim_rejected"
+            and event.payload == {
+                "reason": "atlas_registration_pending",
+                "source": "claim_guard",
+            }
+            for event in events
+        )
+
+
+def test_atlas_control_card_cannot_complete_before_raphael_verification(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setattr(kb, "_completion_contract", lambda: {})
+    atlas_ticket_id = "00000000-0000-4000-8000-000000009999"
+    body = (
+        f"Atlas ticket UUID: {atlas_ticket_id}\n"
+        "Completion contract: worker proposal -> Raphael verification/return "
+        "-> Motoko QA -> Raphael receipt-gated closure."
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="control lifecycle",
+            body=body,
+            assignee="raphael",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test:claim")
+        assert claimed is not None
+
+        with pytest.raises(kb.CompletionContractError) as error:
+            kb.complete_task(
+                conn,
+                task_id,
+                summary="Draft proposal prepared",
+                metadata={"atlas_return_receipt": "not-authoritative"},
+                expected_run_id=claimed.current_run_id,
+            )
+
+        assert "task_event.raphael_return_verified" in error.value.missing
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        events = kb.list_events(conn, task_id)
+        assert any(
+            event.kind == "completion_proposal_required"
+            and event.payload == {
+                "atlas_ticket_id": atlas_ticket_id,
+                "required_event": "raphael_return_verified",
+            }
+            for event in events
+        )
+
+
 def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
@@ -1402,6 +1476,82 @@ def test_claim_succeeds_once_parents_done(kanban_home):
     assert claimed.status == "running"
 
 
+def test_verified_raphael_return_releases_exact_motoko_qa_child_once(kanban_home):
+    """A nonterminal root may release only its receipt-bound Motoko QA child."""
+    with kb.connect() as conn:
+        atlas_id = "26c130d1-70c5-4a1b-89e1-ce0476cc79fd"
+        parent = kb.create_task(
+            conn, title="root", assignee="raphael", idempotency_key=atlas_id,
+        )
+        child = kb.create_task(
+            conn,
+            title="qa",
+            assignee="motoko",
+            parents=[parent],
+            idempotency_key=f"{atlas_id}:{parent}:2:motoko_qa",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='triage', "
+            "current_step_key='awaiting_motoko_qa' WHERE id=?",
+            (parent,),
+        )
+        kb._append_event(
+            conn,
+            parent,
+            "raphael_return_verified",
+            {
+                "atlas_ticket_id": atlas_id,
+                "attempt": 2,
+                "qa_card_id": child,
+                "business_terminal": False,
+            },
+        )
+        conn.commit()
+
+        assert kb.promote_task(
+            conn,
+            child,
+            actor="raphael",
+            reason="verified QA release",
+            dry_run=True,
+        ) == (True, None)
+        assert kb.promote_task(
+            conn, child, actor="raphael", reason="verified QA release",
+        ) == (True, None)
+        first = kb.claim_task(conn, child, claimer="motoko:qa")
+        second = kb.claim_task(conn, child, claimer="motoko:duplicate")
+
+    assert first is not None
+    assert first.status == "running"
+    assert second is None
+
+
+def test_motoko_qa_child_stays_fail_closed_without_verified_return(kanban_home):
+    """A matching-looking QA child cannot bypass the missing return receipt."""
+    with kb.connect() as conn:
+        atlas_id = "26c130d1-70c5-4a1b-89e1-ce0476cc79fd"
+        parent = kb.create_task(
+            conn, title="root", assignee="raphael", idempotency_key=atlas_id,
+        )
+        child = kb.create_task(
+            conn,
+            title="qa",
+            assignee="motoko",
+            parents=[parent],
+            idempotency_key=f"{atlas_id}:{parent}:2:motoko_qa",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='triage', "
+            "current_step_key='awaiting_motoko_qa' WHERE id=?",
+            (parent,),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+
+        assert kb.claim_task(conn, child, claimer="motoko:qa") is None
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_create_with_parents_stays_todo_until_parents_done(kanban_home):
     """kanban_create(parents=[...]) must land in 'todo' and only promote on parent done."""
     with kb.connect() as conn:
@@ -1651,6 +1801,33 @@ def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
         # Dry run must NOT mutate status.
         assert kb.get_task(conn, t1).status == "ready"
         assert kb.get_task(conn, t2).status == "ready"
+
+
+def test_dispatch_guard_skips_atlas_registration_pending_without_writes(
+    kanban_home, all_assignees_spawnable
+):
+    body = (
+        "Atlas ticket: ATL-TEST\n"
+        "Boundary: canonical card creation only\n"
+        "Do not dispatch or start a worker until the next explicit control-test authorization."
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="control boundary",
+            body=body,
+            assignee="raphael",
+        )
+        before_events = len(kb.list_events(conn, task_id))
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert result.spawned == []
+        assert (
+            task_id,
+            "atlas_registration_pending",
+        ) in result.respawn_guarded
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert len(kb.list_events(conn, task_id)) == before_events
 
 
 def test_dispatch_skips_unassigned(kanban_home):
