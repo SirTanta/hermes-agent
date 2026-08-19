@@ -31,6 +31,14 @@ from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 logger = logging.getLogger(__name__)
 
+# Env vars we've already warned about being an unsupported token type this
+# process. resolve_copilot_token() runs on every credential-pool refresh —
+# for a profile where Copilot is only a fallback provider that's never
+# actually invoked, that means the same "GH_TOKEN is a classic PAT" warning
+# on every single refresh cycle. One warning per env var per process is
+# enough; repeats past that are noise, not new information.
+_WARNED_UNSUPPORTED_TOKEN_VARS: set[str] = set()
+
 # OAuth device code flow constants — VS Code's GitHub App client ID.
 # The previous opencode OAuth App ID (Ov23li8tweQw6odWQebz) produces gho_*
 # tokens that cannot be exchanged for Copilot API JWTs (404 on
@@ -84,9 +92,11 @@ def resolve_copilot_token() -> tuple[str, str]:
         if val:
             valid, msg = validate_copilot_token(val)
             if not valid:
-                logger.warning(
-                    "Token from %s is not supported: %s", env_var, msg
-                )
+                if env_var not in _WARNED_UNSUPPORTED_TOKEN_VARS:
+                    _WARNED_UNSUPPORTED_TOKEN_VARS.add(env_var)
+                    logger.warning(
+                        "Token from %s is not supported: %s", env_var, msg
+                    )
                 continue
             return val, env_var
 

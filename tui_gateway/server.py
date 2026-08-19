@@ -4038,7 +4038,18 @@ def _probe_config_health(cfg: dict) -> str:
     if not isinstance(cfg, dict):
         return ""
     warnings: list[str] = []
-    null_keys = sorted(k for k, v in cfg.items() if v is None)
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    # Only flag a null top-level key when its schema default is itself a
+    # dict (an actual "section" meant to hold nested settings, e.g.
+    # `agent:`). Scalar keys such as `context_file_max_chars` or
+    # `max_concurrent_sessions` default to None in DEFAULT_CONFIG — that's
+    # their correct, intentional value, not a dropped section — so they
+    # must never trip this check.
+    null_keys = sorted(
+        k for k, v in cfg.items()
+        if v is None and isinstance(DEFAULT_CONFIG.get(k), dict)
+    )
     if not null_keys:
         pass
     else:
