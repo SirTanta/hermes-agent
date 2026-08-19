@@ -480,7 +480,8 @@ class EventBridge:
 
             try:
                 messages = db.get_messages(session_id)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Skipping session %s: get_messages failed: %s", session_id, exc)
                 continue
 
             if not messages:

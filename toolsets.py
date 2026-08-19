@@ -23,7 +23,10 @@ Usage:
     all_tools = resolve_toolset("full_stack")
 """
 
+import logging
 from typing import List, Dict, Any, Set, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Shared tool list for CLI and all messaging platform toolsets.
@@ -749,8 +752,8 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
                             e.name for e in registry._tools.values()
                             if e.toolset == platform_name
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Registry-derived tools unavailable for %s: %s", platform_name, exc)
                     return list(plugin_tools)
             except Exception:
                 pass

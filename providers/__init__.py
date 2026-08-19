@@ -187,5 +187,5 @@ def _discover_providers() -> None:
                 logger.warning(
                     "Failed to import legacy provider module %s: %s", modname, exc
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Legacy provider module discovery skipped: %s", exc, exc_info=True)
