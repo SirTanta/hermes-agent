@@ -251,8 +251,8 @@ def _build_codex_gpt5_autoraise_notice(
         # gpt-5.3-codex-spark has a native 128K window; the gpt-5.4/5.5/5.6
         # family is capped at 272K by the Codex OAuth backend.
         cap = "128K" if model.startswith("gpt-5.3-codex-spark") else "272K"
-    from_pct = int(round(autoraise["from"] * 100))
-    to_pct = int(round(autoraise["to"] * 100))
+    from_pct = int(round(autoraise.get("from", 0) * 100))
+    to_pct = int(round(autoraise.get("to", 0) * 100))
     return (
         f"ℹ Codex {model} caps context at {cap}, so auto-compaction was raised "
         f"to {to_pct}% (from {from_pct}%) to use more of the window before "
@@ -315,8 +315,8 @@ def _codex_gpt55_autoraise_notice_state(autoraise: Dict[str, Any]) -> str:
     different autoraised Codex model) re-notifies once.
     """
     model = str(autoraise.get("model") or "").strip().lower().rsplit("/", 1)[-1]
-    from_pct = int(round(float(autoraise["from"]) * 100))
-    to_pct = int(round(float(autoraise["to"]) * 100))
+    from_pct = int(round(float(autoraise.get("from", 0)) * 100))
+    to_pct = int(round(float(autoraise.get("to", 0)) * 100))
     return f"{model}:{from_pct}:{to_pct}"
 
 
