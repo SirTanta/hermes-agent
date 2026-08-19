@@ -486,8 +486,8 @@ try:
         for _alias in _pp.aliases:
             if _alias not in PROVIDER_REGISTRY:
                 PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
-except Exception:
-    pass
+except Exception as _exc:
+    logger.debug("Plugin provider registry population skipped: %s", _exc, exc_info=True)
 
 
 # =============================================================================

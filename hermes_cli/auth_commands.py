@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sys
 import time
@@ -31,6 +32,8 @@ import hermes_cli.auth as auth_mod
 from hermes_cli.auth import PROVIDER_REGISTRY
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+logger = logging.getLogger(__name__)
 
 
 # Providers that support OAuth login in addition to API keys.
@@ -191,8 +194,8 @@ def auth_add_command(args) -> None:
             suppressed = _load_auth_store().get("suppressed_sources", {})
             for src in list(suppressed.get(provider, []) or []):
                 unsuppress_credential_source(provider, src)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not unsuppress credential sources for %s: %s", provider, exc)
 
     if requested_type == AUTH_TYPE_API_KEY:
         token = (getattr(args, "api_key", None) or "").strip()

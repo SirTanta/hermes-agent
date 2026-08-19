@@ -38,8 +38,10 @@ def _auth_env(name: str, default: str = "") -> str:
         val = get_secret(name)
         if val is not None and str(val).strip():
             return str(val).strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        from gateway.run import logger
+
+        logger.debug("secret_scope lookup for %s unavailable: %s", name, exc)
     return (os.getenv(name) or default).strip()
 
 
@@ -442,8 +444,10 @@ class GatewayAuthorizationMixin:
                         allowed = _coerce_allow_set(adapter_group_allowed)
                         if "*" in allowed or source.chat_id in allowed:
                             return True
-            except Exception:
-                pass
+            except Exception as exc:
+                from gateway.run import logger
+
+                logger.debug("Adapter group-allowlist check failed: %s", exc)
 
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         # Checked before the no-user-id guard below: some platforms deliver
@@ -523,8 +527,10 @@ class GatewayAuthorizationMixin:
                         platform_env_map[source.platform] = entry.allowed_users_env
                     if entry.allow_all_env:
                         platform_allow_all_map[source.platform] = entry.allow_all_env
-            except Exception:
-                pass
+            except Exception as exc:
+                from gateway.run import logger
+
+                logger.debug("Plugin platform registry lookup failed: %s", exc)
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
