@@ -6067,10 +6067,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Hard cap on per-session pending follow-ups for busy_input_mode=queue
     # (and the draining/steer-fallback/subagent-demotion paths that share
     # this entry point).  Without a cap, a stuck agent + a rapid-fire user
-    # could grow the overflow list unboundedly.  32 turns of queued
-    # follow-ups is far beyond any realistic conversational backlog while
-    # still small enough to never threaten memory.
-    _BUSY_QUEUE_MAX_PENDING = 32
+    # could grow the overflow list unboundedly.  Raised from 32 to 64 after
+    # a live Discord thread proved 32 was reachable under real burst
+    # traffic (~4,800 silent drops logged) — this cap silently discards
+    # the message with no user-facing signal, so it should stay well above
+    # anything a real conversational backlog produces. Still small enough
+    # to never threaten memory.
+    _BUSY_QUEUE_MAX_PENDING = 64
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
