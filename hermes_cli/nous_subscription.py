@@ -411,6 +411,13 @@ def get_nous_subscription_features(
     direct_parallel = bool(get_env_value("PARALLEL_API_KEY"))
     direct_tavily = bool(get_env_value("TAVILY_API_KEY"))
     direct_searxng = bool(get_env_value("SEARXNG_URL"))
+    direct_brave_free = bool(get_env_value("BRAVE_SEARCH_API_KEY"))
+    try:
+        import ddgs as _ddgs_probe  # noqa: F401
+
+        direct_ddgs = True
+    except ImportError:
+        direct_ddgs = False
     direct_fal = fal_key_is_configured()
     direct_fal_video = direct_fal  # same FAL_KEY; separate var so use_gateway is independent
     direct_openai_tts = bool(resolve_openai_audio_api_key())
@@ -525,10 +532,21 @@ def get_nous_subscription_features(
             or (web_search_backend == "firecrawl" and direct_firecrawl)
             or (web_search_backend == "parallel" and direct_parallel)
             or (web_search_backend == "tavily" and direct_tavily)
+            or (web_backend == "ddgs" and direct_ddgs)
+            or (web_search_backend == "ddgs" and direct_ddgs)
+            or (web_backend == "brave-free" and direct_brave_free)
+            or (web_search_backend == "brave-free" and direct_brave_free)
         )
     )
     web_available = bool(
-        managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily or direct_searxng
+        managed_web_available
+        or direct_exa
+        or direct_firecrawl
+        or direct_parallel
+        or direct_tavily
+        or direct_searxng
+        or direct_ddgs
+        or direct_brave_free
     )
 
     image_managed = image_tool_enabled and managed_image_available and not direct_fal
