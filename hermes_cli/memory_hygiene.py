@@ -383,12 +383,17 @@ def apply_hygiene(
         stores_receipt: dict[str, Any] = {}
         new_content: dict[str, bytes] = {}
         for target, store in report["stores"].items():
-            content = _render_entries(store["projected_entries"])
+            content = (
+                _render_entries(store["projected_entries"])
+                if store["plan"]
+                else originals[target]
+            )
+            changed = originals[target] != content
             new_content[target] = content
             stores_receipt[target] = {
                 "file": store["file"],
                 "existed_before": existed[target],
-                "changed": originals[target] != content,
+                "changed": changed,
                 "before_sha256": _sha256(originals[target]),
                 "after_sha256": _sha256(content),
                 "before_chars": store["before_chars"],
@@ -399,7 +404,7 @@ def apply_hygiene(
             }
 
         changed_targets = [
-            target for target in ("memory", "user") if originals[target] != new_content[target]
+            target for target in ("memory", "user") if stores_receipt[target]["changed"]
         ]
         written_targets: list[str] = []
         try:
@@ -566,5 +571,25 @@ def rollback_hygiene(
             "source_receipt": str(receipt_path),
             "safety_backup_dir": str(rollback_backup.resolve()),
         }
-        atomic_json_write(rollback_receipt_path, rollback_receipt, indent=2)
+        try:
+            atomic_json_write(rollback_receipt_path, rollback_receipt, indent=2)
+        except BaseException as exc:
+            retention_errors: list[str] = []
+            for target in changed_targets:
+                try:
+                    _atomic_write_bytes(paths[target], post_apply_contents[target])
+                except BaseException as retention_exc:  # pragma: no cover - catastrophic I/O
+                    retention_errors.append(f"{target}: {retention_exc}")
+            try:
+                rollback_receipt_path.unlink(missing_ok=True)
+            except BaseException as retention_exc:  # pragma: no cover - catastrophic I/O
+                retention_errors.append(f"audit: {retention_exc}")
+            detail = (
+                f"; post-apply retention errors: {', '.join(retention_errors)}"
+                if retention_errors
+                else ""
+            )
+            raise HygieneError(
+                f"rollback audit receipt write failed; post-apply state was retained: {exc}{detail}"
+            ) from exc
         return rollback_receipt

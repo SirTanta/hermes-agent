@@ -194,13 +194,114 @@ def test_apply_does_not_create_or_rewrite_unchanged_user_store(tmp_path: Path) -
     assert receipt["stores"]["user"]["changed"] is False
 
 
+def test_apply_preserves_protected_user_bytes(tmp_path: Path) -> None:
+    memories = tmp_path / "memories"
+    memory_path = _write(memories, "MEMORY.md", ["Cache note.", " cache   note. "])
+    user_path = memories / "USER.md"
+    user_bytes = b"  User prefers concise replies.\r\n\r\n"
+    user_path.write_bytes(user_bytes)
+
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=30,
+        user_char_limit=20,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+
+    assert memory_path.read_text(encoding="utf-8") == "Cache note."
+    assert user_path.read_bytes() == user_bytes
+    assert receipt["stores"]["user"]["actions"] == []
+    assert receipt["stores"]["user"]["changed"] is False
+
+
+@pytest.mark.parametrize(
+    "memory_bytes",
+    [b"\n \n\n", b"\n  Always run release verification.  \n\n"],
+)
+def test_apply_preserves_memory_newlines_and_blank_lines_when_plan_empty(
+    tmp_path: Path, memory_bytes: bytes
+) -> None:
+    memories = tmp_path / "memories"
+    memories.mkdir(parents=True)
+    memory_path = memories / "MEMORY.md"
+    memory_path.write_bytes(memory_bytes)
+
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=20,
+        user_char_limit=100,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+
+    assert memory_path.read_bytes() == memory_bytes
+    assert receipt["stores"]["memory"]["actions"] == []
+    assert receipt["stores"]["memory"]["changed"] is False
+
+
+def test_report_and_apply_preserve_no_candidate_store_bytes(tmp_path: Path) -> None:
+    memories = tmp_path / "memories"
+    memories.mkdir(parents=True)
+    memory_path = memories / "MEMORY.md"
+    memory_bytes = b"Disposable cache note.\n\n"
+    memory_path.write_bytes(memory_bytes)
+
+    report = build_hygiene_report(
+        memories,
+        memory_char_limit=100,
+        user_char_limit=100,
+        target_percent=70,
+        now=NOW,
+    )
+    assert report["stores"]["memory"]["plan"] == []
+    assert memory_path.read_bytes() == memory_bytes
+
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=100,
+        user_char_limit=100,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+
+    assert memory_path.read_bytes() == memory_bytes
+    assert receipt["stores"]["memory"]["actions"] == []
+    assert receipt["stores"]["memory"]["changed"] is False
+
+
+def test_apply_receipt_changed_matches_planned_byte_mutation(tmp_path: Path) -> None:
+    memories = tmp_path / "memories"
+    _write(memories, "MEMORY.md", ["Cache note.", " cache   note. "])
+    user_path = memories / "USER.md"
+    user_bytes = b" User prefers dark mode. \n"
+    user_path.write_bytes(user_bytes)
+
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=30,
+        user_char_limit=20,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+
+    for store in receipt["stores"].values():
+        assert store["changed"] is bool(store["actions"])
+        assert (store["before_sha256"] != store["after_sha256"]) is store["changed"]
+    assert user_path.read_bytes() == user_bytes
+
+
 def test_rollback_restores_backup_and_refuses_post_apply_drift(tmp_path: Path) -> None:
     memories = tmp_path / "memories"
     original = ["Disposable cache.", " disposable   cache. "]
     path = _write(memories, "MEMORY.md", original)
     receipt = apply_hygiene(
         memories,
-        memory_char_limit=100,
+        memory_char_limit=30,
         user_char_limit=100,
         target_percent=70,
         now=NOW,
@@ -213,7 +314,7 @@ def test_rollback_restores_backup_and_refuses_post_apply_drift(tmp_path: Path) -
 
     second = apply_hygiene(
         memories,
-        memory_char_limit=100,
+        memory_char_limit=30,
         user_char_limit=100,
         target_percent=70,
         now=NOW,
@@ -310,3 +411,111 @@ def test_rollback_uses_verified_backup_bytes_without_toctou_reread(
 
     assert tampered is True
     assert path.read_text(encoding="utf-8") == DELIM.join(original)
+
+
+def test_rollback_audit_failure_retains_post_apply_state_and_source_receipt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    memories = tmp_path / "memories"
+    path = _write(memories, "MEMORY.md", ["Cache note.", " cache   note. "])
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=30,
+        user_char_limit=100,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+    receipt_path = Path(receipt["receipt_path"])
+    post_apply_bytes = path.read_bytes()
+    source_receipt_bytes = receipt_path.read_bytes()
+
+    import hermes_cli.memory_hygiene as memory_hygiene
+
+    real_audit_write = memory_hygiene.atomic_json_write
+
+    def write_then_fail(*args, **kwargs) -> None:
+        real_audit_write(*args, **kwargs)
+        raise OSError("simulated rollback audit failure")
+
+    monkeypatch.setattr(
+        memory_hygiene,
+        "atomic_json_write",
+        write_then_fail,
+    )
+
+    with pytest.raises(HygieneError, match="rollback audit receipt write failed"):
+        rollback_hygiene(receipt_path, yes=True, now=NOW)
+
+    assert path.read_bytes() == post_apply_bytes
+    assert receipt_path.read_bytes() == source_receipt_bytes
+    assert list(receipt_path.parent.glob("rollback-*.json")) == []
+
+
+def test_rollback_can_retry_after_audit_failure(tmp_path: Path, monkeypatch) -> None:
+    memories = tmp_path / "memories"
+    original = ["Cache note.", " cache   note. "]
+    path = _write(memories, "MEMORY.md", original)
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=30,
+        user_char_limit=100,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+    receipt_path = Path(receipt["receipt_path"])
+
+    import hermes_cli.memory_hygiene as memory_hygiene
+
+    real_audit_write = memory_hygiene.atomic_json_write
+    attempts = 0
+
+    def fail_once(*args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("simulated rollback audit failure")
+        real_audit_write(*args, **kwargs)
+
+    monkeypatch.setattr(memory_hygiene, "atomic_json_write", fail_once)
+
+    with pytest.raises(HygieneError, match="rollback audit receipt write failed"):
+        rollback_hygiene(receipt_path, yes=True, now=NOW)
+    rollback = rollback_hygiene(receipt_path, yes=True, now=NOW)
+
+    assert attempts == 2
+    assert rollback["status"] == "rolled-back"
+    assert path.read_text(encoding="utf-8") == DELIM.join(original)
+
+
+def test_rollback_keyboard_interrupt_during_audit_retains_post_apply_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    memories = tmp_path / "memories"
+    path = _write(memories, "MEMORY.md", ["Cache note.", " cache   note. "])
+    receipt = apply_hygiene(
+        memories,
+        memory_char_limit=30,
+        user_char_limit=100,
+        target_percent=70,
+        now=NOW,
+        apply=True,
+    )
+    receipt_path = Path(receipt["receipt_path"])
+    post_apply_bytes = path.read_bytes()
+    source_receipt_bytes = receipt_path.read_bytes()
+
+    import hermes_cli.memory_hygiene as memory_hygiene
+
+    monkeypatch.setattr(
+        memory_hygiene,
+        "atomic_json_write",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(HygieneError, match="rollback audit receipt write failed"):
+        rollback_hygiene(receipt_path, yes=True, now=NOW)
+
+    assert path.read_bytes() == post_apply_bytes
+    assert receipt_path.read_bytes() == source_receipt_bytes
