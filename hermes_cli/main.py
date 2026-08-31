@@ -13051,6 +13051,75 @@ def cmd_memory(args):
         save_config(config)
         print("\n  ✓ Memory provider: built-in only")
         print("  Saved to config.yaml\n")
+    elif sub == "hygiene":
+        import json
+        from pathlib import Path
+
+        from hermes_cli.config import load_config
+        from hermes_cli.memory_hygiene import (
+            HygieneError,
+            apply_hygiene,
+            rollback_hygiene,
+        )
+        from hermes_constants import get_hermes_home
+
+        try:
+            if getattr(args, "rollback", None):
+                if not getattr(args, "yes", False):
+                    answer = input("\n  Type 'ROLLBACK' to restore this receipt: ").strip()
+                    if answer != "ROLLBACK":
+                        print("  Cancelled.\n")
+                        return
+                result = rollback_hygiene(Path(args.rollback), yes=True)
+            else:
+                config = load_config() or {}
+                memory_config = config.get("memory", {}) or {}
+                memory_limit = int(memory_config.get("memory_char_limit", 2200))
+                user_limit = int(memory_config.get("user_char_limit", 1375))
+                do_apply = bool(getattr(args, "apply", False))
+                if do_apply and not getattr(args, "yes", False):
+                    answer = input(
+                        "\n  Type 'APPLY' to write the safe plan after creating a backup: "
+                    ).strip()
+                    if answer != "APPLY":
+                        print("  Cancelled.\n")
+                        return
+                result = apply_hygiene(
+                    get_hermes_home() / "memories",
+                    memory_char_limit=memory_limit,
+                    user_char_limit=user_limit,
+                    target_percent=getattr(args, "target_percent", 70),
+                    stale_days=getattr(args, "stale_days", 90),
+                    apply=do_apply,
+                )
+        except (HygieneError, ValueError) as exc:
+            print(f"\n  Memory hygiene refused: {exc}\n", file=sys.stderr)
+            return 2
+
+        if getattr(args, "json", False):
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif result.get("mode") == "dry-run":
+            print("\n  Memory hygiene dry-run (no files changed)")
+            for target, store in result["stores"].items():
+                print(
+                    f"    ◆ {target}: {store['before_percent']}% -> "
+                    f"{store['projected_percent']}%; {len(store['plan'])} safe action(s), "
+                    f"{len(store['protected'])} protected"
+                )
+                for action in store["plan"]:
+                    print(
+                        f"      - {action['classification']}: {action['action']} "
+                        f"entry {action['index'] + 1}"
+                    )
+            print("\n  Review with --json. Apply only with: hermes memory hygiene --apply\n")
+        elif result.get("status") == "applied":
+            print("\n  ✓ Memory hygiene applied atomically")
+            print(f"  Backup: {result['backup_dir']}")
+            print(f"  Audit receipt: {result['receipt_path']}")
+            print(f"  Rollback: {result['rollback_command']}\n")
+        else:
+            print("\n  ✓ Memory hygiene transaction rolled back")
+            print(f"  Audit receipt: {result['receipt_path']}\n")
     elif sub == "reset":
         from hermes_constants import get_hermes_home, display_hermes_home
 

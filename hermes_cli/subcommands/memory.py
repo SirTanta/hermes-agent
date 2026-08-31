@@ -50,4 +50,47 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default="all",
         help="Which store to reset: 'all' (default), 'memory', or 'user'",
     )
+    _hygiene_parser = memory_sub.add_parser(
+        "hygiene",
+        help="Report or conservatively compact built-in durable memory",
+        description=(
+            "Dry-run by default. Identifies safe duplicate, explicitly superseded, "
+            "stale, and losslessly verbose entries while preserving user-profile, "
+            "identity, preference, security, and active operating-rule entries."
+        ),
+    )
+    mode = _hygiene_parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the reported safe plan with backup, rollback, and audit receipt",
+    )
+    mode.add_argument(
+        "--rollback",
+        metavar="RECEIPT",
+        help="Restore an applied transaction from its audit receipt",
+    )
+    _hygiene_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Confirm --apply or --rollback without an interactive prompt",
+    )
+    _hygiene_parser.add_argument(
+        "--target-percent",
+        type=int,
+        default=70,
+        help="Target utilization percentage (1-74; default: 70)",
+    )
+    _hygiene_parser.add_argument(
+        "--stale-days",
+        type=int,
+        default=90,
+        help="Minimum age for explicitly temporary/completed entries (default: 90)",
+    )
+    _hygiene_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the complete machine-readable report or receipt",
+    )
     memory_parser.set_defaults(func=cmd_memory)

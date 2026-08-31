@@ -64,3 +64,27 @@ def test_mcp_and_acp_accept_hooks_flag():
     # acp takes --accept-hooks at top level
     ns = parser.parse_args(["acp", "--accept-hooks"])
     assert ns.accept_hooks is True
+
+
+def test_memory_hygiene_parser_is_dry_run_by_default_and_bounds_apply():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h("memory")
+    build_memory_parser(sub, cmd_memory=handler)
+
+    dry = parser.parse_args(["memory", "hygiene", "--target-percent", "70"])
+    assert dry.func is handler
+    assert dry.memory_command == "hygiene"
+    assert dry.apply is False
+    assert dry.rollback is None
+    assert dry.target_percent == 70
+
+    apply = parser.parse_args(["memory", "hygiene", "--apply", "--yes"])
+    assert apply.apply is True
+    assert apply.yes is True
+
+    rollback = parser.parse_args(
+        ["memory", "hygiene", "--rollback", "/tmp/receipt.json", "--yes"]
+    )
+    assert rollback.apply is False
+    assert rollback.rollback == "/tmp/receipt.json"
