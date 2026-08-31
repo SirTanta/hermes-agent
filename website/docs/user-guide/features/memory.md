@@ -20,13 +20,14 @@ Two files make up the agent's memory:
 Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, replace, or remove entries.
 
 :::info
-Character limits keep memory focused. Memory does **not** auto-compact: when a
-write would exceed the limit, the `memory` tool returns an error instead of
-silently dropping entries. The agent then makes room itself — consolidating or
-removing entries in the same turn before retrying (see [What Happens When Memory
-is Full](#what-happens-when-memory-is-full)). Note that `replace` is also bound
-by the limit: swapping an entry for a longer one can still overflow, so the new
-content must be shortened (or another entry removed) to fit.
+Character limits keep memory focused. The `memory` tool does **not** silently
+auto-compact during a conversation: when a write would exceed the limit, it
+returns an error and the agent must make room in the same turn. Operators can
+separately run the conservative, dry-run-first `hermes memory hygiene` command
+described under [Deterministic operator hygiene](#deterministic-operator-hygiene).
+Note that `replace` is also bound by the limit: swapping an entry for a longer
+one can still overflow, so the new content must be shortened (or another entry
+removed) to fit.
 :::
 
 ## How Memory Appears in the System Prompt
@@ -147,6 +148,33 @@ The agent should then:
 4. Then `add` the new entry
 
 **Best practice:** When memory is above 80% capacity (visible in the system prompt header), consolidate entries before adding new ones. For example, merge three separate "project uses X" entries into one comprehensive project description entry.
+
+### Deterministic operator hygiene
+
+`hermes memory hygiene` reports conservative compaction candidates without
+changing files. It protects all `USER.md` entries plus identity, preference,
+security/approval, active runtime, and active operating-rule entries in
+`MEMORY.md`. Automatic candidates are limited to normalized duplicates,
+explicit superseded/obsolete entries, old explicitly temporary/completed
+entries, and lossless verbose-text compaction.
+
+```bash
+# Dry-run (default), with a target below 75%
+hermes memory hygiene --target-percent 70 --stale-days 90 --json
+
+# Explicit write boundary; creates an atomic backup and audit receipt
+hermes memory hygiene --target-percent 70 --stale-days 90 --apply
+
+# Restore only if memory has not drifted since that receipt
+hermes memory hygiene --rollback /path/to/receipt.json --yes
+```
+
+Apply locks and backs up both built-in stores before writing either one. Any
+write failure restores both stores. The receipt records before/after SHA-256
+values, the exact safe actions, target status, backup path, and rollback
+command. External memory providers are never touched. See the source runbook at
+`docs/memory-hygiene-runbook.md` for the full review, apply, verification, and
+rollback procedure.
 
 ### Practical Examples of Good Memory Entries
 
