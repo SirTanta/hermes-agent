@@ -27,9 +27,16 @@ class TurnFacadeMixin:
         persist_user_display_metadata: Optional[Dict[str, Any]]=None,
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[Dict[str, Any]] = None,
+        turn_sender_human: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Forwarder — see ``agent.conversation_loop.run_conversation``.
+
+        ``turn_sender_human``: server-minted verified human sender for this turn
+        (dashboard-authenticated session). ``None`` means no authenticated sender
+        is bound; the absence rule from the agent's AGENTS.md applies. See
+        ``agent.turn_sender.parse_sender_human`` for the strict-validation contract.
+        """
         # A review shares this session_id for cache parity: fence review startup or interrupt
         # an admitted request and await its exit before opening live-turn instrumentation.
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
@@ -137,6 +144,7 @@ class TurnFacadeMixin:
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
+                        turn_sender_human=turn_sender_human,
                     )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;

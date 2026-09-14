@@ -540,10 +540,19 @@ def _stage_turn_user_message(
     persist_user_timestamp: Optional[float], persist_user_platform_id: Optional[str],
     persist_user_display_kind: Optional[str],
     persist_user_display_metadata: Optional[Dict[str, Any]],
+    sender_marker: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Any]:
     """Build this turn's user dict, reusing CLI-staged input only when its clean text
     matches this turn (a stale handoff must not replace later input; voice turns
-    compare the clean override). Returns ``(user_msg, pending_cli_message)``."""
+    compare the clean override). Returns ``(user_msg, pending_cli_message)``.
+
+    ``sender_marker``: a server-minted short line identifying the verified human
+    sender of this turn (built by ``agent.turn_sender.sender_human_marker``).
+    Empty string or None means no authenticated sender is bound — the agent must
+    apply the absence rule from its AGENTS.md. The marker is **prepended to the
+    model-facing content only**, never to the persisted user row, so it does not
+    pollute the transcript surface the user sees. The system prompt is byte-stable
+    regardless (prompt-cache invariant)."""
     pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
     expected_persist_content = (
         persist_user_message if persist_user_message is not None else user_message
@@ -563,6 +572,44 @@ def _stage_turn_user_message(
     # CLI input is stamped when staged; gateway input may carry the platform event
     # time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
+
+    # Server-minted authenticated-sender marker on the MODEL-FACING content only.
+    # Persist content (the transcript row) stays the clean text the user typed so
+    # the displayed history isn't polluted with attribution headers. A user message
+    # that is already a structured content list (multimodal) keeps its list shape and
+    # gets the marker as a leading text part — providers that don't allow mixed
+    # parts are caught by the existing content validation downstream.
+    if sender_marker:
+        # ``persist_user_message`` is the caller's "clean text" override; when
+        # absent, the live ``user_message`` IS the clean text (typical CLI /
+        # non-voice path). ``_stage_turn_user_message`` runs AFTER the agent's
+        # persist override was set from this same value (see _bind_turn_identity),
+        # so the live content the wire sees gets the marker but the durable row
+        # gets the override — except when the caller never passed an override,
+        # in which case the agent's _persist_user_message_override is None and
+        # durable_user_row_content would otherwise persist the marker-prefixed
+        # bytes (the bug this guard closes).
+        persist_content = persist_user_message if persist_user_message is not None else user_message
+        marker_content = f"{sender_marker}\n{persist_content}" if isinstance(persist_content, str) else sender_marker
+        if isinstance(user_msg.get("content"), list):
+            # Insert at the front of a multimodal content list (text parts only);
+            # leave non-text-first lists untouched so a top image isn't displaced.
+            content_list = list(user_msg["content"])
+            if content_list and isinstance(content_list[0], dict) and content_list[0].get("type") == "text":
+                existing = content_list[0].get("text", "")
+                content_list[0] = {**content_list[0], "text": f"{sender_marker}\n{existing}" if existing else sender_marker}
+                user_msg["content"] = content_list
+            else:
+                user_msg["content"] = [{"type": "text", "text": marker_content}, *content_list]
+        else:
+            user_msg["content"] = marker_content
+        # Pin the durable row to the clean text. Set it explicitly (not just
+        # via the caller's optional ``persist_user_message`` kwarg) so the
+        # transcript never shows the attribution header even when the CLI /
+        # non-voice caller didn't pre-supply an override. A pre-supplied
+        # override already pointed at the clean text, so this assignment is a
+        # no-op in that path.
+        agent._persist_user_message_override = persist_content
 
     # Synthesized turns stamp their transcript type so the crash persist writes a typed
     # row; the model still receives role/content unchanged (api_messages strips both).
@@ -855,6 +902,7 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[Dict[str, Any]]=None, turn_author: Optional[Dict[str, Any]]=None,
+    turn_sender_human: Optional[Dict[str, Any]]=None,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -873,6 +921,13 @@ def build_turn_context(
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
+
+    # Same reset for the authenticated human sender (per-turn; server-stamped only — see
+    # agent.turn_sender.parse_sender_human). A previous turn's verified sender must never
+    # leak into a new turn from the same gateway-cached agent.
+    from agent.turn_sender import parse_sender_human, sender_human_marker
+    turn_sender_human = parse_sender_human(turn_sender_human)
+    agent._sender_human = turn_sender_human
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.
@@ -920,6 +975,7 @@ def build_turn_context(
     user_msg, pending_cli_message = _stage_turn_user_message(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+        sender_marker=sender_human_marker(turn_sender_human),
     )
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.

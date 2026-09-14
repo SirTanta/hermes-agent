@@ -4079,15 +4079,23 @@ def _sync_cli_session_id_from_agent(cli) -> None:
 
 def _run_quiet_single_query(cli, effective_query):
     """Quiet (-Q) one-shot turn: run, print the response (stderr for errors/session_id), then sys.exit with the automation exit code.
-    HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it."""
+    HERMES_TURN_AUTHOR (set only by a bot-to-bot dispatcher) is consumed here so tool subprocesses do not inherit it.
+    HERMES_SENDER_HUMAN (set by a parent dispatcher from the verified dashboard session) is consumed here for the
+    same reason — and so the one-shot path mirrors the dashboard-authenticated turn the agent would have received
+    if the user had typed it in their own browser rather than via a programmatic handoff. The auth-provider state is
+    read-only: a JSON client cannot mint this env var; only the parent's server-stamped identity propagates here."""
     from agent.interrupt_compat import _accepts_keyword
     from agent.turn_author import take_turn_author_from_env
+    from agent.turn_sender import take_sender_human_from_env
 
     author = take_turn_author_from_env()
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+    sender_human = take_sender_human_from_env()
+    sender_kwargs = {"turn_sender_human": sender_human} if sender_human is not None and _accepts_keyword(cli.agent.run_conversation, "turn_sender_human") else {}
     try:
         result = cli.agent.run_conversation(
-            user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
+            user_message=effective_query, conversation_history=cli.conversation_history,
+            **author_kwargs, **sender_kwargs,
         )
     except KeyboardInterrupt:
         _emit_interrupted_session_end(cli, reason="keyboard_interrupt")

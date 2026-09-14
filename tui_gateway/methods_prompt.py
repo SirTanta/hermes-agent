@@ -16,6 +16,41 @@ _profile_scoped = _registry.profile_scoped
 _STALE_TARGET_MSG = "target user message is no longer in session history"
 _GROUP_PROBE_FAILED_MSG = "Could not verify this group. Try again after the gateway recovers."
 
+# Sentinel returned by ``_resolved_sender_human_for_request`` when a JSON client tries
+# to mint a sender through ``_sender_human`` (mirrors the ``_turn_author`` refusal
+# pattern at line 4124). The caller maps this to a 4124 error envelope.
+_SENDER_REFUSED = object()
+
+
+def _resolved_sender_human_for_request(params: dict):
+    """Server-minted verified-human sender for this prompt.submit call.
+
+    Returns a ``{user_id, email, display_name, org_id, provider}`` dict ready
+    for ``agent.turn_sender.parse_sender_human``, ``None`` when no
+    authenticated sender is bound (stdio, internal, peer relay), or the
+    ``_SENDER_REFUSED`` sentinel when a JSON client tried to mint a sender
+    through RPC params (the caller must 4124 in that case). Identity authority
+    is the ``auth_identity`` stamped on the active WS transport at WS-upgrade
+    auth time (``web_server_chat._ws_auth_reason``). A client cannot supply it
+    through RPC params: any attempt is refused here, not silently ignored.
+    """
+    from .methods_browser_control import _is_authenticated_identity  # local import for testability
+    from .transport import current_transport
+    # First, refuse client-minted sender the same way ``_turn_author`` is refused.
+    if params.get("_sender_human") is not None:
+        return _SENDER_REFUSED  # sentinel; the caller refuses with 4124
+    transport = current_transport()
+    if transport is None:
+        return None
+    auth_identity = getattr(transport, "auth_identity", None)
+    if not _is_authenticated_identity(auth_identity):
+        return None
+    # Promote the dashboard's {user_id, provider} dict into the full sender
+    # shape. ``parse_sender_human`` accepts the partial dict (it returns None
+    # only when user_id or provider is missing).
+    from agent.turn_sender import parse_sender_human
+    return parse_sender_human(auth_identity)
+
 
 def _history_user_indices(history: list) -> list:
     """Indices of canonical live-user turns, including composite carriers."""
@@ -471,7 +506,8 @@ def _persist_session_row_for_submit(rid, session):
     return error
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None):
+def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback,
+                            turn_author=None, turn_sender_human=None):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
@@ -501,7 +537,8 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+        turn_sender_human=turn_sender_human)
 
 
 _TRUNCATION_PARAMS = (
@@ -566,6 +603,15 @@ def _(rid, params: dict) -> dict:
     if raw_author is not None and not isinstance(raw_author, DeliveryAuthor):
         return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
     turn_author = raw_author.author if raw_author is not None else None
+    # Server-minted verified-human sender: stamped from the WS auth (see web_server_chat._ws_auth_reason
+    # and WSTransport.auth_identity). A JSON client cannot populate it — only the parent's server-stamped
+    # identity reaches here via current_transport().auth_identity. Absent for stdio / loopback / internal.
+    # The Telegram path delivers sender via a different gateway code path (gateway/run_turn_runner.py),
+    # not via this RPC.
+    resolved_sender = _resolved_sender_human_for_request(params)
+    if resolved_sender is _SENDER_REFUSED:
+        return _err(rid, 4124, "turn sender is stamped by the gateway, never by a client")
+    turn_sender_human = resolved_sender
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
@@ -631,7 +677,8 @@ def _(rid, params: dict) -> dict:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
                          turn_author.get("id"))
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind)
+            rid, sid, session, text, display_kind=display_kind,
+            turn_sender_human=turn_sender_human)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -654,7 +701,8 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
+            turn_sender_human),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

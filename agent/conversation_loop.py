@@ -1433,6 +1433,7 @@ def _run_conversation_turn(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    turn_sender_human: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
@@ -1468,6 +1469,7 @@ def _run_conversation_turn(
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
             turn_author=turn_author,
+            turn_sender_human=turn_sender_human,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,
@@ -1584,6 +1586,7 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    turn_sender_human: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1591,6 +1594,13 @@ def run_conversation(
     tool-limit, preflight timeout, codex runtime — passes through here, so the
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
+
+    ``turn_sender_human``: the verified human sender of THIS turn (server-stamped from the
+    authenticated dashboard session, never from a client parameter — see
+    ``agent.turn_sender.parse_sender_human``). ``None`` when no authenticated sender is
+    bound (CLI chat, cron, peer relay), in which case the agent applies the absence rule
+    from its AGENTS.md. The agent's transcript displays the user's clean text; the marker
+    rides on the model-facing content only.
     """
     from agent.turn_context import export_current_turn_boundary
 
@@ -1608,6 +1618,7 @@ def run_conversation(
         persist_user_platform_id=persist_user_platform_id,
         moa_config=moa_config,
         turn_author=turn_author,
+        turn_sender_human=turn_sender_human,
     )
     return export_current_turn_boundary(agent, result, user_message)
 

@@ -49,12 +49,20 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
-    queued_prompt_generation: int | None = None, display_kind: str | None = None) -> dict:
+    queued_prompt_generation: int | None = None, display_kind: str | None = None,
+    turn_sender_human: dict | None = None) -> dict:
+    """Build the turn.start frame for the compute-host child.
+
+    ``turn_sender_human``: the verified human sender for this turn (server-stamped
+    from the dashboard ``auth_identity``). Carried on the frame so the child process
+    sees the same sender its in-process sibling does (see ``agent.turn_sender``);
+    absent when no authenticated sender is bound (CLI chat, peer relay).
+    """
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
-    return {
+    frame: dict = {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
         **({"display_kind": display_kind} if display_kind else {}), "history": history,
@@ -67,6 +75,9 @@ def _compute_host_turn_frame(
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation}
+    if turn_sender_human:
+        frame["turn_sender_human"] = turn_sender_human
+    return frame
 
 
 def _metadata_mirror(session: dict | None) -> dict:
@@ -212,11 +223,22 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
-    queued_prompt_generation: int | None = None, display_kind: str | None = None) -> dict:
+    queued_prompt_generation: int | None = None, display_kind: str | None = None,
+    turn_sender_human: dict | None = None) -> dict:
+    """Submit a turn to the compute-host child process (turn isolation).
+
+    ``turn_sender_human``: the verified human sender for this turn (server-stamped
+    from the dashboard ``auth_identity``). Threaded onto the turn.start frame so
+    the child process sees the same attribution the in-process path applies — a
+    turn that silently runs unattributed because it happened to hit isolated
+    compute defeats the entire point of attribution. ``None`` when no sender is
+    bound; the agent's AGENTS.md absence rule then applies.
+    """
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
-                                     display_kind=display_kind)
+                                     display_kind=display_kind,
+                                     turn_sender_human=turn_sender_human)
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex

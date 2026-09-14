@@ -406,6 +406,11 @@ class AIAgent(
         self._user_turn_count = 0
         # Who wrote the current turn. build_turn_context() sets it at the start of every turn.
         self._turn_author = None
+        # Who the verified human sender of the current turn is. Server-stamped from the authenticated
+        # dashboard session (see agent.turn_sender.parse_sender_human) and reset per turn by
+        # build_turn_context(); None when no authenticated sender is bound (CLI chat, cron, peer
+        # relay). The cached gateway agent must never carry a previous turn's sender forward.
+        self._sender_human = None
         # Copilot x-initiator: True for the first API call of a user turn, False for tool-loop follow-ups.
         self._is_user_initiated_turn = False
 

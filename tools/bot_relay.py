@@ -424,6 +424,18 @@ def delivery_env(author: Optional[dict]) -> dict[str, str]:
     env.pop(TURN_AUTHOR_ENV, None)
     if author:
         env.update(turn_author_env(author))
+    # Forward the verified human sender the gateway stamped onto THIS process's env (set
+    # by ``tui_gateway/methods_prompt.prompt.submit`` from the authenticated dashboard
+    # session). The receiving subprocess reads it via ``agent.turn_sender.sender_human_from_env``
+    # so the receiving agent sees who actually sent the DM — not "some human" assumed to be Jon.
+    # The sender field is server-minted only; a JSON client cannot populate it (the existing
+    # explicit-refusal in ``tui_gateway/methods_bot_relay.py`` for bot authors applies
+    # identically here). Absent when no sender is bound — the recipient then applies the
+    # AGENTS.md absence rule rather than defaulting to a name.
+    from agent.turn_sender import SENDER_HUMAN_ENV, sender_human_from_env
+    sender = sender_human_from_env(env)
+    if sender:
+        env[SENDER_HUMAN_ENV] = json.dumps(sender, separators=(",", ":"))
     return env
 
 

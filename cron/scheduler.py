@@ -1909,8 +1909,28 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to end session: %s", job_id, e)
     try:
-        from hermes_state_registry import release_or_close
-        release_or_close(_session_db)
+        # An external cron worker is a SEPARATE OS process from the long-lived gateway that also
+        # holds this SAME state.db open. A normal Python-level close() here calls sqlite3's
+        # conn.close(), which (independent of and after any app-level PRAGMA checkpoint) runs
+        # SQLite's own built-in "am I the last connection? if so delete -wal/-shm" cleanup -- and
+        # it can be wrong about being last, deleting the sidecar files out from under the
+        # gateway's still-open handle (confirmed 2026-09-13: every DeletedWalGenerationError
+        # incident on raphael/motoko/sakuya/deed lined up with this exact call in this exact
+        # subprocess). All of this function's writes (title, end_session, lifecycle booking) are
+        # already committed above this line, so skipping the close loses no data -- the fd is
+        # simply reclaimed by the kernel when this worker process exits via os._exit() right
+        # after (see cron/scheduler.py's --external-worker-file entrypoint), which is the same
+        # failure mode SQLite's WAL design is already built to tolerate (a hard crash). The
+        # in-process gateway tick path (this same function, same file, no external worker env
+        # marker) is unaffected and still closes normally.
+        if os.environ.get("_HERMES_CRON_EXTERNAL_WORKER"):
+            logger.debug(
+                "Job '%s': external cron worker -- skipping SessionDB close to avoid "
+                "racing the gateway's WAL generation; connection reclaimed at process exit.",
+                job_id)
+        else:
+            from hermes_state_registry import release_or_close
+            release_or_close(_session_db)
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
@@ -3851,9 +3871,22 @@ if __name__ == "__main__":
             setup_logging(hermes_home=_get_hermes_home(), mode="cron")
         except Exception:
             pass
-        raise SystemExit(
-            0 if _run_external_worker_payload(args.external_worker_file, args.ack_file) else 1
-        )
+        _worker_ok = _run_external_worker_payload(args.external_worker_file, args.ack_file)
+        # os._exit(), not SystemExit/sys.exit(): this subprocess's one job is already done and
+        # its own cleanup (secret scope, hermes_home override) already ran in
+        # _run_external_worker_payload's own finally blocks above. A normal interpreter
+        # shutdown here still runs every global atexit hook, including hermes's own SessionDB,
+        # which pins itself via atexit specifically to run SQLite's close-time WAL checkpoint --
+        # and that checkpoint is what deletes this profile's state.db -wal/-shm out from under
+        # the separate, long-lived gateway process still attached to the SAME file (confirmed
+        # 2026-09-13: DeletedWalGenerationError incidents on raphael/motoko/sakuya lined up
+        # exactly with this worker subprocess's lifetime). Committed writes are already durable
+        # in the WAL regardless of how this process exits -- SQLite is built to tolerate a hard
+        # crash here, which is exactly what os._exit() causes it to see. Flush stdio first since
+        # os._exit() skips normal buffering too.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if _worker_ok else 1)
     tick(verbose=True)
 
 

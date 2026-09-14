@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import strip_stale_dangerous_confirmations
+from agent.turn_sender import parse_sender_human
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.sender_identity import lookup_telegram_sender
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -33,6 +35,35 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _resolved_sender_human_for_source(source) -> Optional[Dict[str, Any]]:
+    """Resolve a verified-human sender from a gateway SessionSource.
+
+    Today only Telegram needs this (the adapter carries ``from_user.id`` and
+    ``user_name`` but never the user's email); a future channel that already
+    mints its own identity via the WS auth path will skip this helper. The
+    function lives here, NOT in the adapter, so the agent contract
+    (``turn_sender_human`` kwarg) is the only thing callers know about.
+
+    Returns ``None`` for an unmapped telegram_id or a non-Telegram source —
+    the agent's AGENTS.md absence rule then applies. Returned dicts match
+    ``agent.turn_sender.parse_sender_human``'s contract so they can pass
+    straight through ``build_turn_context``.
+    """
+    platform = getattr(source, "platform", None)
+    if platform == Platform.TELEGRAM:
+        telegram_user_id = getattr(source, "user_id", None)
+        sender = lookup_telegram_sender(telegram_user_id)
+        if sender is None:
+            return None
+        # ``parse_sender_human`` validates the contract; ``None`` here would
+        # mean the registry is malformed (missing user_id / provider).
+        return parse_sender_human(sender)
+    # Other transports either mint their own identity (dashboard WS — handled
+    # in the tui_gateway prompt.submit path) or don't carry a human sender
+    # at all (peer relay, cron). The absence rule applies.
+    return None
 
 
 class _ExecApprovalDeclined(RuntimeError):
@@ -1519,6 +1550,15 @@ class TurnRunner:
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
                                          "is_bot": bool(getattr(ctx.source, "is_bot", False))}
+            # Verified-human sender: resolved from the transport's own identity source. Today the
+            # only transport that does NOT mint its own identity is Telegram (the adapter carries
+            # only ``from_user.id`` + ``user_name``), so we map telegram_id → {name, email, ...}
+            # via ``gateway.sender_identity``. The dashboard path mints its own identity at
+            # WS-upgrade auth time and stamps it onto the request — that path is handled in the
+            # TUI gateway's ``prompt.submit`` handler, NOT here. Absent → the agent applies the
+            # AGENTS.md absence rule rather than defaulting to a name.
+            if _accepts_keyword(agent.run_conversation, "turn_sender_human"):
+                kwargs["turn_sender_human"] = _resolved_sender_human_for_source(ctx.source)
             if persist_user_message_override is not None:
                 kwargs["persist_user_message"] = persist_user_message_override
             elif observed_group_context:
